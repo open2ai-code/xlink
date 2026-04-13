@@ -1,0 +1,547 @@
+"""
+终端控件模块
+基于QPlainTextEdit实现的自定义SSH终端
+"""
+
+import re
+from PyQt6.QtWidgets import QPlainTextEdit, QMenu, QToolBar, QToolButton, QApplication
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QTextCharFormat, QFont, QAction, QKeySequence
+from core.terminal_buffer import ANSIParser
+from core.ssh_manager import SSHConnection
+
+
+class TerminalWidget(QPlainTextEdit):
+    """自定义SSH终端控件"""
+    
+    def __init__(self, font_size: int = 13):
+        super().__init__()
+        
+        # 设置终端属性
+        self.setReadOnly(False)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setFont(QFont("Cascadia Code", font_size))
+        
+        # 性能优化: 限制最大行数,防止内存溢出
+        self.setMaximumBlockCount(10000)  # 最多保留10000行
+        
+        # 命令历史记录
+        self.command_history = []
+        self.history_index = -1
+        self.current_input = ""
+        
+        # ANSI解析器
+        self.ansi_parser = ANSIParser()
+        
+        # 数据缓冲区(用于处理被分割的ANSI序列)
+        self.receive_buffer = ""
+        
+        # 是否忽略服务器回显(因为我们已经在本地显示了)
+        self.ignore_echo = False
+        
+        # SSH连接
+        self.ssh_connection = None
+        
+        # 输入位置标记(用户只能在此位置之后输入)
+        self.input_position = 0
+        
+        # 标志: 是否需要设置 input_position
+        self.need_set_input_position = True
+        
+        # 设置右键菜单
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._show_context_menu)
+        
+        # 创建快捷工具栏
+        self._create_toolbar()
+        
+        # 连接数据接收信号
+        # 注意: 这个会在外部连接具体的SSHConnection对象
+    
+    def _process_backspace(self, text: str) -> str:
+        """
+        处理退格字符 - 简化版本,只处理\x08和空格
+        真正的删除由ANSI解析器处理\x1b[K序列
+        
+        Args:
+            text: 包含退格字符的文本
+            
+        Returns:
+            处理后的文本
+        """
+        result = []
+        i = 0
+        while i < len(text):
+            if text[i] == '\x08':  # 退格字符
+                # 删除前一个字符(普通字符)
+                if result and result[-1] not in '\033':
+                    result.pop()
+                # 跳过退格后的空格
+                if i + 1 < len(text) and text[i + 1] == ' ':
+                    i += 1
+            else:
+                result.append(text[i])
+            i += 1
+        return ''.join(result)
+    
+    def set_ssh_connection(self, connection: SSHConnection):
+        """
+        设置SSH连接
+        
+        Args:
+            connection: SSHConnection对象
+        """
+        self.ssh_connection = connection
+        self.ssh_connection.data_received.connect(self.append_data)
+        
+        # 设置标志,表示需要重新设置 input_position
+        self.need_set_input_position = True
+        
+        # 自动获得焦点,方便用户直接输入
+        self.setFocus()
+    
+    def _create_toolbar(self):
+        """创建快捷工具栏"""
+        # 注意: 工具栏作为终端控件的一部分,显示在顶部
+        # 由于QPlainTextEdit不直接支持toolbar,我们使用父窗口的toolbar
+        # 这里只定义actions,由父窗口添加到toolbar
+        
+        # 清屏动作
+        self.clear_action = QAction("清屏", self)
+        self.clear_action.setToolTip("清除终端输出 (Ctrl+L)")
+        self.clear_action.setShortcut(QKeySequence("Ctrl+L"))
+        self.clear_action.triggered.connect(self.clear_screen)
+        
+        # 重启连接动作
+        self.restart_action = QAction("重启连接", self)
+        self.restart_action.setToolTip("断开并重新连接SSH")
+        self.restart_action.triggered.connect(self.restart_connection)
+        
+        # 复制全部动作
+        self.copy_all_action = QAction("复制全部", self)
+        self.copy_all_action.setToolTip("复制终端所有输出到剪贴板")
+        self.copy_all_action.triggered.connect(self.copy_all_text)
+        
+        # 复制选中动作
+        self.copy_selection_action = QAction("复制选中", self)
+        self.copy_selection_action.setToolTip("复制选中的文本 (Ctrl+C)")
+        self.copy_selection_action.setShortcut(QKeySequence.StandardKey.Copy)
+        self.copy_selection_action.triggered.connect(self.copy)
+    
+    def clear_screen(self):
+        """清屏"""
+        self.clear()
+        self.input_position = 0
+        self.need_set_input_position = True
+    
+    def restart_connection(self):
+        """重启连接"""
+        if self.ssh_connection:
+            # 由父窗口处理重启逻辑
+            self.restart_requested.emit()
+    
+    def copy_all_text(self):
+        """复制所有文本"""
+        all_text = self.toPlainText()
+        clipboard = QApplication.clipboard()
+        clipboard.setText(all_text)
+    
+    # 信号: 请求重启连接
+    restart_requested = pyqtSignal()
+    
+    def append_data(self, data: str):
+        """
+        追加SSH服务器返回的数据
+        
+        Args:
+            data: 从服务器接收的文本数据
+        """
+        # 调试: 打印接收到的原始数据
+        print(f"[DEBUG] 接收到数据: {repr(data)}")
+        
+        # 将新数据添加到缓冲区
+        self.receive_buffer += data
+        
+        # 调试: 打印原始数据
+        print(f"[DEBUG] 原始数据: {repr(self.receive_buffer)}")
+        
+        # 先移除所有ANSI删除序列 (\x1b[K, \x1b[0K, \x1b[1K, \x1b[2K 等)
+        # 使用更宽松的正则,匹配所有 \x1b[...K 格式
+        original_buffer = self.receive_buffer
+        self.receive_buffer = re.sub(r'\x1b\[[0-9;]*K', '', self.receive_buffer)
+        
+        if self.receive_buffer != original_buffer:
+            print(f"[DEBUG] 移除ANSI序列后: {repr(self.receive_buffer)}")
+        
+        # 然后处理退格字符 \x08
+        if '\x08' in self.receive_buffer:
+            print(f"[DEBUG] 检测到退格字符,处理前: {repr(self.receive_buffer)}")
+            
+            # 计算有效退格次数
+            # 注意: \x08 \x08 (退格+空格+退格) 是删除一个字符的完整操作
+            # 整个 \x08 \x08 序列只算1次退格
+            temp_buffer = self.receive_buffer
+            backspace_count = 0
+            i = 0
+            print(f"[DEBUG] 开始计算退格次数, 缓冲区: {repr(temp_buffer)}")
+            while i < len(temp_buffer):
+                if temp_buffer[i] == '\x08':
+                    backspace_count += 1
+                    print(f"[DEBUG] 在位置 {i} 发现退格, 当前计数: {backspace_count}")
+                    # 跳过 \x08 \x08 整个序列 (退格+空格+退格)
+                    # 即跳过3个字符: \x08 + ' ' + \x08
+                    if i + 2 < len(temp_buffer) and temp_buffer[i+1] == ' ' and temp_buffer[i+2] == '\x08':
+                        print(f"[DEBUG] 跳过整个 \\x08 \\x08 序列 (位置 {i} 到 {i+2})")
+                        i += 3
+                        continue
+                    # 如果只是 \x08 + ' ', 跳过2个字符
+                    elif i + 1 < len(temp_buffer) and temp_buffer[i + 1] == ' ':
+                        print(f"[DEBUG] 跳过位置 {i+1} 的空格")
+                        i += 2
+                        continue
+                i += 1
+            
+            print(f"[DEBUG] 最终退格次数: {backspace_count}")
+            
+            # 在终端上删除相应数量的字符
+            if backspace_count > 0:
+                print(f"[DEBUG] 执行删除 {backspace_count} 个字符")
+                print(f"[DEBUG] 删除前 input_position: {self.input_position}")
+                print(f"[DEBUG] 删除前 need_set_input_position: {self.need_set_input_position}")
+                
+                cursor = self.textCursor()
+                print(f"[DEBUG] 删除前光标位置: {cursor.position()}, input_position: {self.input_position}")
+                cursor.movePosition(cursor.MoveOperation.End)
+                print(f"[DEBUG] 移动到末尾后光标位置: {cursor.position()}")
+                
+                # 删除最后一个字符(重复backspace_count次)
+                # 但不能删除到 input_position 之前
+                deleted = 0
+                for _ in range(backspace_count):
+                    print(f"[DEBUG] 循环检查: cursor.position()={cursor.position()}, input_position={self.input_position}")
+                    if cursor.position() > self.input_position:
+                        cursor.deletePreviousChar()
+                        deleted += 1
+                        print(f"[DEBUG] 删除了1个字符, 已删除: {deleted}")
+                    else:
+                        print(f"[DEBUG] 到达input_position,停止删除")
+                        break
+                
+                print(f"[DEBUG] 总共删除: {deleted} 个字符")
+                print(f"[DEBUG] 删除后 input_position: {self.input_position} (不变)")
+                self.setTextCursor(cursor)
+            
+            self.receive_buffer = self._process_backspace(self.receive_buffer)
+            print(f"[DEBUG] 处理后: {repr(self.receive_buffer)}")
+            
+            # 移除控制字符(\x07 响铃等)
+            self.receive_buffer = re.sub(r'[\x00-\x06\x07\x09-\x1f]', '', self.receive_buffer)
+            if self.receive_buffer:
+                print(f"[DEBUG] 移除控制字符后: {repr(self.receive_buffer)}")
+        
+        # 检查缓冲区是否包含完整的ANSI序列
+        # 如果缓冲区以ESC开头但没有完整的序列,等待更多数据
+        if '\033' in self.receive_buffer:
+            # 检查是否有未完成的ANSI序列
+            esc_pos = self.receive_buffer.rfind('\033')
+            after_esc = self.receive_buffer[esc_pos:]
+            
+            # 如果ESC后面没有完整的序列(以字母结尾),则等待
+            if not re.search(r'\033\[[0-9;]*[A-Za-z]', after_esc):
+                # 可能还有更多数据,暂时不处理
+                # 但为了避免卡住,设置一个最大等待时间
+                if len(self.receive_buffer) > 1000:
+                    pass  # 缓冲区太大,强制处理
+                else:
+                    # 如果缓冲区包含普通文本(不仅仅是ESC序列),先处理
+                    if len(self.receive_buffer) > len(after_esc):
+                        pass  # 有普通文本,继续处理
+                    else:
+                        return
+        
+        # 处理缓冲区中的数据
+        text_to_process = self.receive_buffer
+        self.receive_buffer = ""
+        
+        print(f"[DEBUG] text_to_process: {repr(text_to_process)}, 长度: {len(text_to_process)}")
+        
+        # 解析ANSI序列
+        segments = self.ansi_parser.parse(text_to_process)
+        
+        # 处理控制命令
+        for cmd in self.ansi_parser.commands:
+            if cmd.command_type == 'clear_screen':
+                # 执行清屏
+                self.clear()
+                # 清屏后需要重新设置 input_position
+                self.need_set_input_position = True
+                print(f"[DEBUG] 清屏后需要重新设置 input_position")
+                # 不要return,继续处理剩余的文本(如提示符)
+        
+        # 如果有文本内容要显示(包括空格)
+        if len(text_to_process) > 0:
+            # 移动到文档末尾
+            cursor = self.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            
+            # 解析ANSI序列并显示
+            for segment in segments:
+                format = QTextCharFormat()
+                
+                # 设置前景色
+                if segment.fg_color:
+                    format.setForeground(QColor(segment.fg_color))
+                else:
+                    format.setForeground(QColor("#d4d4d4"))
+                
+                # 设置背景色
+                if segment.bg_color:
+                    format.setBackground(QColor(segment.bg_color))
+                else:
+                    format.setBackground(QColor("#1e1e1e"))
+                
+                # 设置字体粗细
+                if segment.bold:
+                    format.setFontWeight(QFont.Weight.Bold)
+                else:
+                    format.setFontWeight(QFont.Weight.Normal)
+                
+                # 设置下划线
+                format.setFontUnderline(segment.underline)
+                
+                # 插入文本
+                cursor.insertText(segment.text, format)
+                    
+            # 检查是否是提示符,如果是则更新 input_position
+            # 注意: 每次收到提示符都要更新,因为位置会变化
+            stripped = text_to_process.rstrip()
+            if len(text_to_process) > 0 and (stripped.endswith('#') or stripped.endswith('$') or '#' in text_to_process):
+                # 这是提示符,更新 input_position
+                self.input_position = self.document().characterCount() - 1
+                self.need_set_input_position = False
+                print(f"[DEBUG] 检测到提示符,更新 input_position 为: {self.input_position}")
+                print(f"[DEBUG] 文档总字符数: {self.document().characterCount()}")
+            elif self.need_set_input_position:
+                # 需要设置但还没收到提示符
+                print(f"[DEBUG] 跳过非提示符消息,不设置 input_position")
+        
+        # 滚动到底部
+        self.verticalScrollBar().setValue(
+            self.verticalScrollBar().maximum()
+        )
+    
+    def keyPressEvent(self, event):
+        """
+        处理键盘事件
+        
+        Args:
+            event: 键盘事件
+        """
+        # Enter键 - 发送命令
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self._send_command()
+            return
+        
+        # 上下箭头 - 命令历史
+        if event.key() == Qt.Key.Key_Up:
+            self._history_previous()
+            return
+        
+        if event.key() == Qt.Key.Key_Down:
+            self._history_next()
+            return
+        
+        # Backspace键 - 只发送到服务器,让服务器处理删除和回显
+        if event.key() == Qt.Key.Key_Backspace:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x08 \x08')  # 退格+空格+退格
+            return
+        
+        # Delete键 - 通常不发送到服务器,因为终端中很少用到
+        if event.key() == Qt.Key.Key_Delete:
+            return
+        
+        # Ctrl+C - 复制 或 发送中断信号
+        if event.key() == Qt.Key.Key_C and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            cursor = self.textCursor()
+            if cursor.hasSelection():
+                # 有选中文本,执行复制
+                self.copy()
+            else:
+                # 无选中,发送Ctrl+C到服务器
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x03')
+            return
+        
+        # Ctrl+V - 粘贴
+        if event.key() == Qt.Key.Key_V and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.paste()
+            return
+        
+        # Ctrl+L - 清屏
+        if event.key() == Qt.Key.Key_L and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.clear()
+            self.input_position = self.document().characterCount() - 1
+            return
+        
+        # Left/Right箭头 - 移动到服务器
+        if event.key() == Qt.Key.Key_Left:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[D')  # ANSI左箭头
+            return
+        
+        if event.key() == Qt.Key.Key_Right:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[C')  # ANSI右箭头
+            return
+        
+        # Home键
+        if event.key() == Qt.Key.Key_Home:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[H')  # ANSI Home
+            return
+        
+        # End键
+        if event.key() == Qt.Key.Key_End:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[F')  # ANSI End
+            return
+        
+        # 空格键 - 特殊处理,因为event.text()可能为空
+        if event.key() == Qt.Key.Key_Space:
+            print(f"[DEBUG] 检测到空格键")
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                print(f"[DEBUG] 发送空格到服务器")
+                self.ssh_connection.send_data(' ')
+            else:
+                print(f"[DEBUG] SSH未连接")
+            return
+        
+        # 其他可打印字符 - 只发送到服务器,不本地显示
+        if event.text() and event.text().isprintable():
+            # 直接发送到服务器,服务器会回显
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data(event.text())
+            return
+        
+        # 其他按键交给父类处理
+        super().keyPressEvent(event)
+    
+    def _send_command(self):
+        """发送用户输入的命令到SSH服务器"""
+        if not self.ssh_connection or not self.ssh_connection.is_connected:
+            return
+        
+        # 获取当前行输入(用于历史记录)
+        cursor = self.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.setPosition(self.input_position, cursor.MoveMode.KeepAnchor)
+        command = cursor.selectedText()
+        
+        # 添加到历史记录
+        if command.strip():
+            self.command_history.append(command)
+            # 限制历史记录数量
+            if len(self.command_history) > 100:
+                self.command_history.pop(0)
+            self.history_index = len(self.command_history)
+        
+        # 发送回车到服务器
+        self.ssh_connection.send_data('\n')
+        
+        # 更新输入位置
+        self.input_position = self.document().characterCount() - 1
+    
+    def _history_previous(self):
+        """显示上一条命令历史"""
+        if not self.command_history or self.history_index <= 0:
+            return
+        
+        self.history_index -= 1
+        self._replace_current_command(self.command_history[self.history_index])
+    
+    def _history_next(self):
+        """显示下一条命令历史"""
+        if not self.command_history or self.history_index >= len(self.command_history) - 1:
+            # 清空输入
+            self._replace_current_command("")
+            self.history_index = len(self.command_history)
+            return
+        
+        self.history_index += 1
+        self._replace_current_command(self.command_history[self.history_index])
+    
+    def _replace_current_command(self, text: str):
+        """
+        替换当前输入的命令
+        
+        Args:
+            text: 新的命令文本
+        """
+        cursor = self.textCursor()
+        cursor.movePosition(cursor.MoveOperation.End)
+        cursor.setPosition(self.input_position, cursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        cursor.insertText(text)
+    
+    def _show_context_menu(self, pos):
+        """
+        显示右键菜单
+        
+        Args:
+            pos: 鼠标位置
+        """
+        menu = QMenu(self)
+        
+        # 复制动作
+        copy_action = QAction("复制", self)
+        copy_action.setShortcut("Ctrl+C")
+        copy_action.triggered.connect(self.copy)
+        menu.addAction(copy_action)
+        
+        # 粘贴动作
+        paste_action = QAction("粘贴", self)
+        paste_action.setShortcut("Ctrl+V")
+        paste_action.triggered.connect(self.paste)
+        menu.addAction(paste_action)
+        
+        menu.addSeparator()
+        
+        # 全选
+        select_all_action = QAction("全选", self)
+        select_all_action.setShortcut("Ctrl+A")
+        select_all_action.triggered.connect(self.selectAll)
+        menu.addAction(select_all_action)
+        
+        # 清屏
+        clear_action = QAction("清屏", self)
+        clear_action.setShortcut("Ctrl+L")
+        clear_action.triggered.connect(self.clear_terminal)
+        menu.addAction(clear_action)
+        
+        menu.exec(self.mapToGlobal(pos))
+    
+    def clear_terminal(self):
+        """清空终端显示"""
+        self.clear()
+        self.input_position = self.document().characterCount() - 1
+    
+    def set_font_size(self, size: int):
+        """
+        设置字体大小
+        
+        Args:
+            size: 字体大小
+        """
+        font = self.font()
+        font.setPointSize(size)
+        self.setFont(font)
+    
+    def focusInEvent(self, event):
+        """获得焦点事件"""
+        super().focusInEvent(event)
+        # 确保光标在输入位置
+        cursor = self.textCursor()
+        if cursor.position() < self.input_position:
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.setTextCursor(cursor)
