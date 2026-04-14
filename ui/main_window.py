@@ -166,6 +166,16 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
+        # SFTP文件管理面板切换
+        self.sftp_action = QAction("📁 SFTP面板", self)
+        self.sftp_action.setToolTip("显示/隐藏SFTP文件管理面板")
+        self.sftp_action.setCheckable(True)
+        self.sftp_action.setChecked(True)  # 默认显示
+        self.sftp_action.triggered.connect(self._toggle_sftp_panel)
+        toolbar.addAction(self.sftp_action)
+        
+        toolbar.addSeparator()
+        
         # 主题切换
         theme_action = QAction("🎨 切换主题", self)
         theme_action.setToolTip("切换深浅主题")
@@ -244,6 +254,29 @@ class MainWindow(QMainWindow):
         self.session_manager.set_font_size(new_size)
         self.tab_manager.set_font_size(new_size)
         self._show_status_message(f"字体大小: {new_size}")
+    
+    def _toggle_sftp_panel(self):
+        """切换SFTP面板显示/隐藏"""
+        current_terminal = self.tab_manager.get_current_terminal()
+        if not current_terminal:
+            self._show_status_message("请先连接一个会话")
+            self.sftp_action.setChecked(False)
+            return
+        
+        # 查找当前标签页中的SFTP面板
+        container = current_terminal.parent()
+        if container:
+            from ui.sftp_panel import SftpPanel
+            sftp_panels = container.findChildren(SftpPanel)
+            if sftp_panels:
+                sftp_panel = sftp_panels[0]
+                is_visible = sftp_panel.isVisible()
+                sftp_panel.setVisible(not is_visible)
+                
+                if not is_visible:
+                    self._show_status_message("SFTP面板已显示")
+                else:
+                    self._show_status_message("SFTP面板已隐藏")
     
     def _show_status_message(self, message: str):
         """
