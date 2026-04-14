@@ -200,11 +200,19 @@ class TabManager(QTabWidget):
     
     def get_current_terminal(self) -> TerminalWidget:
         """获取当前终端控件"""
-        container = self.currentWidget()
-        if container:
-            # 查找容器中的TerminalWidget
-            for child in container.findChildren(TerminalWidget):
-                return child
+        widget = self.currentWidget()
+        print(f"[TAB DEBUG] get_current_terminal: widget={widget}, type={type(widget).__name__ if widget else None}")
+        if widget:
+            # 如果直接是 TerminalWidget
+            if isinstance(widget, TerminalWidget):
+                print(f"[TAB DEBUG] 直接返回 TerminalWidget")
+                return widget
+            # 如果在容器中，查找 TerminalWidget
+            terminals = widget.findChildren(TerminalWidget)
+            if terminals:
+                print(f"[TAB DEBUG] 在容器中找到 TerminalWidget")
+                return terminals[0]
+        print(f"[TAB DEBUG] 未找到 TerminalWidget，返回 None")
         return None
     
     def set_font_size(self, size: int):
@@ -214,11 +222,19 @@ class TabManager(QTabWidget):
         Args:
             size: 字体大小
         """
+        print(f"[FONT DEBUG] set_font_size 被调用, size={size}, tab数量={self.count()}")
         self.font_size = size
         for i in range(self.count()):
-            terminal = self.widget(i)
-            if isinstance(terminal, TerminalWidget):
-                terminal.set_font_size(size)
+            widget = self.widget(i)
+            print(f"[FONT DEBUG] Tab {i} 的 widget 类型: {type(widget).__name__}")
+            if isinstance(widget, TerminalWidget):
+                print(f"[FONT DEBUG] 直接设置 TerminalWidget 字体为 {size}")
+                widget.set_font_size(size)
+            else:
+                # 如果有容器，查找其中的 TerminalWidget
+                for terminal in widget.findChildren(TerminalWidget):
+                    print(f"[FONT DEBUG] 在容器中找 TerminalWidget，设置字体为 {size}")
+                    terminal.set_font_size(size)
     
     def close_all_connections(self):
         """关闭所有SSH连接"""

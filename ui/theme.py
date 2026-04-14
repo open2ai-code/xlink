@@ -85,7 +85,6 @@ QPlainTextEdit {
     color: #d4d4d4;
     border: none;
     font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
-    font-size: 13px;
     padding: 8px;
     selection-background-color: #264f78;
 }
@@ -377,7 +376,6 @@ QPlainTextEdit {
     color: #d4d4d4;
     border: none;
     font-family: "Cascadia Code", "Consolas", "Courier New", monospace;
-    font-size: 13px;
     padding: 8px;
     selection-background-color: #264f78;
 }

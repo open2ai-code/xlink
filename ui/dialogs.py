@@ -135,8 +135,11 @@ class SessionDialog(QDialog):
         """获取会话数据"""
         auth_method = 'key' if self.auth_combo.currentText() == "密钥认证" else 'password'
         
+        # 如果是编辑模式，保留原有ID；否则生成新ID
+        session_id = self.session_data.get('id', str(uuid.uuid4())) if self.session_data else str(uuid.uuid4())
+        
         return {
-            'id': self.session_data.get('id', str(uuid.uuid4())),
+            'id': session_id,
             'name': self.name_edit.text().strip(),
             'host': self.host_edit.text().strip(),
             'port': self.port_spin.value(),

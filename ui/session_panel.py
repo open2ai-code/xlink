@@ -130,7 +130,7 @@ class SessionPanel(QTreeWidget):
         dialog = SessionDialog(self)
         if dialog.exec():
             # 获取数据并保存
-            data = dialog.get_data()
+            data = dialog.get_session_data()
             self.session_manager.add_session(data)
             self._load_sessions()
             self.session_edit.emit(data)
@@ -154,7 +154,7 @@ class SessionPanel(QTreeWidget):
         dialog = SessionDialog(self, session_data)
         if dialog.exec():
             # 获取数据并更新
-            data = dialog.get_data()
+            data = dialog.get_session_data()
             self.session_manager.update_session(session_data['id'], data)
             self._load_sessions()
             self.session_edit.emit(data)

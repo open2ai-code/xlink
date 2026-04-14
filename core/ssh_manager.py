@@ -228,6 +228,11 @@ class SSHConnection(QObject):
             self._set_state(self.STATE_CONNECTED)
             self._reconnect_attempts = 0
             self._running = True
+            
+            # 注意: 不在这里发送初始化命令，因为shell可能还没准备好
+            # 改为在_data_read_loop中检测提示符后再发送
+            # 这样可以确保命令在shell完全启动后执行
+            
             self._last_activity_time = time.time()
             
             logger.info(f"SSH连接成功: {host}:{port}")

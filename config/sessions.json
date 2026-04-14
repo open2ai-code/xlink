@@ -8,9 +8,20 @@
       "username": "root",
       "timeout": 30,
       "auth_type": "password",
-      "password": "Z0FBQUFBQnAzZVNFR2k0UGJXTWJTeWlFQlRnNUpERU41Qk9WeXBUMXpkNkZvaHdSMVZuSmJzNkhoVVF2NTVOMkY3ZlVJb2FVYkxNemJXbUJTU1VnYURGMmljazEyaE1LeGVoRkxxcVh3Nkw4V2ZmSGVmV0RXdnM9",
+      "password": "Z0FBQUFBQnAzZ3BpaW5ab2VwMllUZEd5MTNBTlNqQm9kRDJrWEJHUXh2Z0VYRDZNdTNjMHo4R1NKQmxSWDFUSWhqYTZVakhNTFhrZmJEc0RvRlkzSTRNV1hrc2N3X2I2ZEJCdkd4UlFTbDVBOExVTlRjYnNQSjA9",
       "key_file": "",
       "id": "91c981c3-325c-409b-a184-15fc37b7e5c3"
+    },
+    {
+      "id": "fb7fa8df-b523-4469-8541-f896f74b3d50",
+      "name": "10.72.12.701",
+      "host": "10.72.12.70",
+      "port": 22,
+      "username": "root",
+      "password": "Z0FBQUFBQnAzZ3BpeUY1VlFaX2pvNkROb1p6bzVxYnRmemlqR1dwOVZfRWNtQnZWVWRkWVRvcVdaX3pWY2FJanE4cmMtbmZCeUx4blBSbm5GSVQ2Qkx0dkV1T1BFakZ5cmktSFF1LWlHRHFtemFFQng4OXRZUEE9",
+      "auth_method": "password",
+      "key_path": "",
+      "remember": false
     }
   ],
   "settings": {
@@ -18,7 +29,7 @@
       1536,
       801
     ],
-    "font_size": 24,
+    "font_size": 17,
     "theme": "light"
   }
 }

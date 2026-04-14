@@ -105,7 +105,8 @@ class ANSIParser:
         
         # 匹配所有其他未处理的CSI序列
         # \033[<params><final-byte>
-        self.csi_pattern = re.compile(r'\033\[[0-9;]*[A-Za-z]')
+        # 注意: 排除 'm' (SGR颜色序列),因为它已经被 ansi_pattern 处理
+        self.csi_pattern = re.compile(r'\033\[[0-9;]*[A-Za-su-z]')  # 排除m
         
         # 当前样式状态
         self.reset_state()
@@ -158,6 +159,13 @@ class ANSIParser:
         print(f"[ANSI] ===== 开始解析 =====")
         print(f"[ANSI] 输入文本: {repr(text)}")
         print(f"[ANSI] 十六进制: {text.encode('utf-8').hex()}")
+        
+        # 调试: 检查是否包含ANSI颜色序列
+        if '\033[' in text and 'm' in text:
+            print(f"[ANSI COLOR] ✅ 检测到ANSI颜色序列!")
+            color_matches = re.findall(r'\033\[[0-9;]*m', text)
+            if color_matches:
+                print(f"[ANSI COLOR] 颜色序列: {color_matches[:5]}...")  # 只显示前5个
         
         # 调试: 检查OSC序列
         osc_matches = self.osc_pattern.findall(text)
@@ -221,11 +229,24 @@ class ANSIParser:
         # 6. 移除光标移动序列
         text = self.cursor_pattern.sub('', text)
         
-        # 7. 移除其他CSI序列
-        text = self.csi_pattern.sub('', text)
-        
-        # 分割ANSI序列
+        # 6. 先分割ANSI颜色序列 (必须在删除CSI之前!)
         parts = self.ansi_pattern.split(text)
+        
+        # 7. 对每个部分删除其他CSI序列
+        processed_parts = []
+        for i, part in enumerate(parts):
+            if i % 2 == 1:  # 奇数索引是颜色参数，保留
+                processed_parts.append(part)
+            else:  # 偶数索引是文本，删除其中的CSI序列
+                processed_parts.append(self.csi_pattern.sub('', part))
+        
+        parts = processed_parts
+        
+        # 调试: 打印split结果
+        print(f"[ANSI DEBUG] split后parts数量: {len(parts)}")
+        if len(parts) <= 20:  # 只在数量不多时打印
+            for idx, part in enumerate(parts):
+                print(f"[ANSI DEBUG] parts[{idx}]: {repr(part[:50])}{'...' if len(part) > 50 else ''}")
         
         # parts交替包含: 文本, 参数, 文本, 参数...
         current_text = ""

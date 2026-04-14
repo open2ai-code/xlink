@@ -249,18 +249,6 @@ class MainWindow(QMainWindow):
         """
         # 创建终端标签页
         self.tab_manager.create_new_tab(session_data)
-        
-        # 获取刚创建的SSH连接
-        current_terminal = self.tab_manager.get_current_terminal()
-        if current_terminal and current_terminal in self.tab_manager.connections:
-            ssh_connection = self.tab_manager.connections[current_terminal]
-            
-            # 连接成功后打开SFTP文件管理器窗口
-            def on_connected(status):
-                if status == "connected":
-                    self._open_sftp_file_manager(ssh_connection)
-            
-            ssh_connection.connection_status.connect(on_connected)
     
     def _open_sftp_file_manager(self, ssh_connection=None):
         """
@@ -304,19 +292,55 @@ class MainWindow(QMainWindow):
     
     def _zoom_in(self):
         """放大字体"""
-        current_size = self.session_manager.get_font_size()
-        new_size = min(current_size + 1, 24)
-        self.session_manager.set_font_size(new_size)
-        self.tab_manager.set_font_size(new_size)
-        self._show_status_message(f"字体大小: {new_size}")
+        print("[ZOOM DEBUG] ===== _zoom_in 方法被调用 =====")
+        # 获取当前终端的实际字体大小
+        current_terminal = self.tab_manager.get_current_terminal()
+        print(f"[ZOOM DEBUG] current_terminal: {current_terminal}")
+        if current_terminal:
+            current_font = current_terminal.font()
+            # 优先使用 pixelSize，如果为 -1 则使用 pointSize
+            if current_font.pixelSize() > 0:
+                current_size = current_font.pixelSize()
+            else:
+                current_size = current_font.pointSize()
+            
+            new_size = min(current_size + 1, 24)
+            print(f"[ZOOM DEBUG] _zoom_in: 当前终端实际字体={current_size}, 新字体={new_size}")
+            
+            # 更新配置
+            self.session_manager.set_font_size(new_size)
+            
+            # 应用到所有终端
+            print(f"[ZOOM DEBUG] 调用 tab_manager.set_font_size({new_size})")
+            self.tab_manager.set_font_size(new_size)
+            self._show_status_message(f"字体大小: {new_size}")
+        else:
+            self._show_status_message("请先打开一个终端")
     
     def _zoom_out(self):
         """缩小字体"""
-        current_size = self.session_manager.get_font_size()
-        new_size = max(current_size - 1, 8)
-        self.session_manager.set_font_size(new_size)
-        self.tab_manager.set_font_size(new_size)
-        self._show_status_message(f"字体大小: {new_size}")
+        # 获取当前终端的实际字体大小
+        current_terminal = self.tab_manager.get_current_terminal()
+        if current_terminal:
+            current_font = current_terminal.font()
+            # 优先使用 pixelSize，如果为 -1 则使用 pointSize
+            if current_font.pixelSize() > 0:
+                current_size = current_font.pixelSize()
+            else:
+                current_size = current_font.pointSize()
+            
+            new_size = max(current_size - 1, 8)
+            print(f"[ZOOM DEBUG] _zoom_out: 当前终端实际字体={current_size}, 新字体={new_size}")
+            
+            # 更新配置
+            self.session_manager.set_font_size(new_size)
+            
+            # 应用到所有终端
+            print(f"[ZOOM DEBUG] 调用 tab_manager.set_font_size({new_size})")
+            self.tab_manager.set_font_size(new_size)
+            self._show_status_message(f"字体大小: {new_size}")
+        else:
+            self._show_status_message("请先打开一个终端")
     
     def _toggle_sftp_panel(self):
         """切换SFTP面板显示/隐藏"""

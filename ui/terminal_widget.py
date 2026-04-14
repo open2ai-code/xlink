@@ -25,7 +25,12 @@ class TerminalWidget(QPlainTextEdit):
         # 注意: 不能使用 setReadOnly(True),因为这会隐藏光标
         # 我们通过事件过滤器来阻止所有输入,同时保持光标可见
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-        self.setFont(QFont("Cascadia Code", font_size))
+        
+        # 创建字体并明确设置 pixelSize（SSH客户端常用字体）
+        # 优先使用 Consolas（Windows自带），备选其他等宽字体
+        font = QFont("Consolas")
+        font.setPixelSize(font_size)
+        self.setFont(font)
         
         # 设置光标可见
         self.setCursorWidth(8)  # 设置光标宽度(块状光标)
@@ -54,6 +59,10 @@ class TerminalWidget(QPlainTextEdit):
         
         # SSH连接
         self.ssh_connection = None
+        
+        # 颜色配置标志
+        self._color_config_sent = False  # 是否已发送颜色配置
+        self._filtering_config_echo = False  # 是否正在过滤配置回显
         
         # 输入位置标记(用户只能在此位置之后输入)
         self.input_position = 0
@@ -89,12 +98,9 @@ class TerminalWidget(QPlainTextEdit):
         """切换光标可见性(闪烁效果)"""
         self._cursor_visible = not self._cursor_visible
         
-        # 更新光标位置
-        cursor = self.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.setTextCursor(cursor)
-        
-        # 注意: QPlainTextEdit的光标闪烁是自动的，这里主要是确保光标在正确位置
+        # 注意: QPlainTextEdit的光标闪烁是自动的，不需要手动移动光标
+        # 手动移动光标会导致窗口滚动，影响用户体验
+        # 这里只是记录状态，不执行任何光标操作
     
     def _process_backspace(self, text: str) -> str:
         """
@@ -121,6 +127,31 @@ class TerminalWidget(QPlainTextEdit):
                 result.append(text[i])
             i += 1
         return ''.join(result)
+    
+    def _send_color_config(self):
+        """
+        发送颜色配置命令
+        在shell完全启动后调用，确保alias等配置生效
+        """
+        if not self.ssh_connection or not self.ssh_connection.is_connected:
+            return
+        
+        print(f"[COLOR] 发送颜色配置命令")
+        # 发送配置命令，使用 --color=always 强制启用颜色
+        config_cmd = (
+            'export TERM=xterm-256color; '
+            'export CLICOLOR=1; '
+            'export LS_COLORS="di=01;34:ln=01;36:so=01;35:pi=40;33:ex=01;32:bd=40;33;01:cd=40;33;01:su=48;5;196;37:sg=48;5;11;37:tw=48;5;27;37:ow=48;5;34;37:st=48;5;21;37"; '
+            'alias ls="ls --color=always"; '
+            'alias ll="ls -al --color=always"; '
+            'alias grep="grep --color=always"\n'
+        )
+        self.ssh_connection.send_data(config_cmd)
+        
+        # 标记需要过滤接下来的回显
+        self._filtering_config_echo = True
+        # 使用定时器在1秒后停止过滤（配置命令执行大约需要几百毫秒）
+        QTimer.singleShot(1000, lambda: setattr(self, '_filtering_config_echo', False))
     
     def set_ssh_connection(self, connection: SSHConnection):
         """
@@ -195,13 +226,15 @@ class TerminalWidget(QPlainTextEdit):
                 if segment.fg_color:
                     format.setForeground(QColor(segment.fg_color))
                 else:
-                    format.setForeground(QColor("#d4d4d4"))
+                    # 使用更柔和的默认前景色（VS Code风格）
+                    format.setForeground(QColor("#D4D4D4"))
                 
                 # 设置背景色
                 if segment.bg_color:
                     format.setBackground(QColor(segment.bg_color))
                 else:
-                    format.setBackground(QColor("#1e1e1e"))
+                    # 使用深灰色背景（VS Code Dark+风格）
+                    format.setBackground(QColor("#1E1E1E"))
                 
                 # 设置字体粗细
                 if segment.bold:
@@ -276,6 +309,16 @@ class TerminalWidget(QPlainTextEdit):
         Args:
             data: 从服务器接收的文本数据
         """
+        # 过滤颜色配置命令的回显
+        if hasattr(self, '_filtering_config_echo') and self._filtering_config_echo:
+            # 如果正在过滤配置回显，检查是否包含配置命令
+            # 注意：只过滤完整的配置命令行
+            if ('export LS_COLORS=' in data or 'export CLICOLOR=' in data or 
+                'alias ls="ls --color' in data or 'alias ll="ls -al --color' in data or
+                'export TERM=xterm' in data or 'alias grep=' in data):
+                print(f"[COLOR] 过滤配置命令回显: {repr(data[:50])}...")
+                return  # 直接返回，不显示
+        
         # 调试: 打印接收到的原始数据
         print(f"[APPEND DEBUG] ===== 接收到数据 =====")
         print(f"[APPEND DEBUG] 原始数据: {repr(data)}")
@@ -459,6 +502,13 @@ class TerminalWidget(QPlainTextEdit):
                 # 需要在 _flush_pending_segments 中更新
                 self.need_set_input_position = False
                 print(f"[DEBUG] 检测到提示符,将在渲染后更新 input_position")
+                
+                # 首次检测到提示符后，发送颜色配置命令
+                if not self._color_config_sent and self.ssh_connection and self.ssh_connection.is_connected:
+                    print(f"[COLOR] 首次检测到提示符，发送颜色配置")
+                    self._color_config_sent = True
+                    # 延迟100ms发送，确保shell已完全就绪
+                    QTimer.singleShot(100, self._send_color_config)
             elif self.need_set_input_position:
                 # 需要设置但还没收到提示符
                 print(f"[DEBUG] 跳过非提示符消息,不设置 input_position")
@@ -596,7 +646,7 @@ class TerminalWidget(QPlainTextEdit):
         
         # Ctrl+V - 粘贴
         if event.key() == Qt.Key.Key_V and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.paste()
+            self._paste_to_terminal()
             return
         
         # Ctrl+L - 清屏
@@ -843,17 +893,82 @@ class TerminalWidget(QPlainTextEdit):
     
     def focusInEvent(self, event):
         """重写: 焦点进入事件"""
-        # 调用父类方法,但确保光标在正确位置
+        # 调用父类方法
         super().focusInEvent(event)
-        # 移动光标到文档末尾
+        # 在鼠标操作期间，禁止移动光标
+        if getattr(self, '_is_mouse_operating', False):
+            return
+        # 只有在没有选中文本时，才移动光标到末尾
         cursor = self.textCursor()
-        cursor.movePosition(cursor.MoveOperation.End)
-        self.setTextCursor(cursor)
+        if not cursor.hasSelection():
+            cursor.movePosition(cursor.MoveOperation.End)
+            self.setTextCursor(cursor)
+    
+    def focusOutEvent(self, event):
+        """失去焦点事件"""
+        super().focusOutEvent(event)
     
     def mousePressEvent(self, event):
         """重写: 鼠标点击事件"""
-        # 允许鼠标选择文本
-        super().mousePressEvent(event)
+        # 设置鼠标操作标志
+        self._is_mouse_operating = True
+        
+        # 如果是右键点击，且已经有选中文本，不要清除选择
+        if event.button() == Qt.MouseButton.RightButton:
+            cursor = self.textCursor()
+            if cursor.hasSelection():
+                # 有选中文本，保持选择不变
+                return
+        
+        # 左键点击：获取鼠标按下位置
+        cursor = self.cursorForPosition(event.pos())
+        # 限制在input_position范围内
+        if hasattr(self, 'input_position'):
+            cursor.setPosition(min(cursor.position(), self.input_position))
+        # 设置光标
+        self.setTextCursor(cursor)
+        # 记录锚点
+        self._mouse_anchor = cursor.position()
+        self._is_dragging = True
+    
+    def mouseMoveEvent(self, event):
+        """重写: 鼠标移动事件 (拖动选择)"""
+        if event.buttons() & event.button().LeftButton and getattr(self, '_is_dragging', False):
+            # 获取鼠标位置
+            mouse_cursor = self.cursorForPosition(event.pos())
+            target_pos = mouse_cursor.position()
+            
+            # 限制在input_position范围内
+            if hasattr(self, 'input_position'):
+                target_pos = min(target_pos, self.input_position)
+            
+            # 只在位置真正改变时才更新
+            current_cursor = self.textCursor()
+            if current_cursor.position() != target_pos or current_cursor.anchor() != self._mouse_anchor:
+                # 创建新的光标对象
+                new_cursor = self.textCursor()
+                # 设置选择范围
+                if target_pos >= self._mouse_anchor:
+                    new_cursor.setPosition(self._mouse_anchor, new_cursor.MoveMode.MoveAnchor)
+                    new_cursor.setPosition(target_pos, new_cursor.MoveMode.KeepAnchor)
+                else:
+                    new_cursor.setPosition(self._mouse_anchor, new_cursor.MoveMode.MoveAnchor)
+                    new_cursor.setPosition(target_pos, new_cursor.MoveMode.KeepAnchor)
+                # 应用光标
+                self.setTextCursor(new_cursor)
+        # 不调用父类方法
+    
+    def mouseReleaseEvent(self, event):
+        """重写: 鼠标释放事件"""
+        # 清除拖动标记
+        self._is_dragging = False
+        if hasattr(self, '_mouse_anchor'):
+            del self._mouse_anchor
+        # 延迟清除鼠标操作标志，确保右键菜单等操作完成
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(100, lambda: setattr(self, '_is_mouse_operating', False))
+        # 允许父类处理鼠标释放
+        super().mouseReleaseEvent(event)
     
     def mouseDoubleClickEvent(self, event):
         """重写: 鼠标双击事件"""
@@ -924,18 +1039,27 @@ class TerminalWidget(QPlainTextEdit):
         Args:
             pos: 鼠标位置
         """
+        # 设置鼠标操作标志
+        self._is_mouse_operating = True
+        
         menu = QMenu(self)
         
         # 复制动作
         copy_action = QAction("复制", self)
         copy_action.setShortcut("Ctrl+C")
         copy_action.triggered.connect(self.copy)
+        # 检查是否有选中文本
+        has_selection = self.textCursor().hasSelection()
+        copy_action.setEnabled(has_selection)
         menu.addAction(copy_action)
         
         # 粘贴动作
         paste_action = QAction("粘贴", self)
         paste_action.setShortcut("Ctrl+V")
-        paste_action.triggered.connect(self.paste)
+        paste_action.triggered.connect(self._paste_to_terminal)
+        # 检查剪贴板是否有内容
+        clipboard = QApplication.clipboard()
+        paste_action.setEnabled(bool(clipboard.text()))
         menu.addAction(paste_action)
         
         menu.addSeparator()
@@ -946,18 +1070,67 @@ class TerminalWidget(QPlainTextEdit):
         select_all_action.triggered.connect(self.selectAll)
         menu.addAction(select_all_action)
         
+        # 复制全部文本
+        copy_all_action = QAction("复制全部", self)
+        copy_all_action.triggered.connect(self.copy_all_text)
+        menu.addAction(copy_all_action)
+        
+        menu.addSeparator()
+        
         # 清屏
         clear_action = QAction("清屏", self)
         clear_action.setShortcut("Ctrl+L")
         clear_action.triggered.connect(self.clear_terminal)
         menu.addAction(clear_action)
         
+        menu.addSeparator()
+        
+        # 字体大小调整
+        font_menu = menu.addMenu("字体大小")
+        
+        font_increase = QAction("放大", self)
+        font_increase.triggered.connect(lambda: self._change_font_size(1))
+        font_menu.addAction(font_increase)
+        
+        font_decrease = QAction("缩小", self)
+        font_decrease.triggered.connect(lambda: self._change_font_size(-1))
+        font_menu.addAction(font_decrease)
+        
+        font_reset = QAction("重置", self)
+        font_reset.triggered.connect(lambda: self.set_font_size(10))
+        font_menu.addAction(font_reset)
+        
+        # 显示菜单，并在关闭后延迟清除标志
+        menu.aboutToHide.connect(lambda: QTimer.singleShot(100, lambda: setattr(self, '_is_mouse_operating', False)))
         menu.exec(self.mapToGlobal(pos))
+    
+    def _change_font_size(self, delta: int):
+        """
+        调整字体大小
+        
+        Args:
+            delta: 变化量 (+1 或 -1)
+        """
+        current_font = self.font()
+        # 统一使用 pixelSize
+        if current_font.pixelSize() > 0:
+            current_size = current_font.pixelSize()
+        else:
+            current_size = current_font.pointSize()
+        
+        new_size = max(8, min(24, current_size + delta))  # 限制在8-24之间
+        print(f"[FONT DEBUG] _change_font_size: 当前={current_size}, delta={delta}, 新={new_size}")
+        self.set_font_size(new_size)
     
     def clear_terminal(self):
         """清空终端显示"""
-        self.clear()
-        self.input_position = self.document().characterCount() - 1
+        if self.ssh_connection and self.ssh_connection.is_connected:
+            # 发送clear命令到服务器
+            self.ssh_connection.send_data('clear\n')
+        else:
+            # 如果没有连接，直接清空本地显示
+            self.clear()
+            self.input_position = 0
     
     def set_font_size(self, size: int):
         """
@@ -966,15 +1139,38 @@ class TerminalWidget(QPlainTextEdit):
         Args:
             size: 字体大小
         """
-        font = self.font()
-        font.setPointSize(size)
-        self.setFont(font)
+        print(f"[FONT DEBUG] TerminalWidget.set_font_size 被调用, size={size}")
+        old_font = self.font()
+        print(f"[FONT DEBUG] 当前字体: {old_font.family()}, pointSize: {old_font.pointSize()}, pixelSize: {old_font.pixelSize()}")
+        
+        # 重新创建字体对象，而不是修改现有字体
+        # 使用 SSH 客户端常用字体
+        new_font = QFont("Consolas")
+        new_font.setPixelSize(size)
+        print(f"[FONT DEBUG] 新字体对象: {new_font.family()}, pointSize: {new_font.pointSize()}, pixelSize: {new_font.pixelSize()}")
+        
+        self.setFont(new_font)
+        
+        # 验证设置后的字体
+        applied_font = self.font()
+        print(f"[FONT DEBUG] 应用后字体: {applied_font.family()}, pointSize: {applied_font.pointSize()}, pixelSize: {applied_font.pixelSize()}")
     
-    def focusInEvent(self, event):
-        """获得焦点事件"""
-        super().focusInEvent(event)
-        # 确保光标在输入位置
-        cursor = self.textCursor()
-        if cursor.position() < self.input_position:
-            cursor.movePosition(cursor.MoveOperation.End)
-            self.setTextCursor(cursor)
+    def _paste_to_terminal(self):
+        """
+        粘贴文本到终端（发送到SSH服务器）
+        """
+        # 获取剪贴板内容
+        clipboard = QApplication.clipboard()
+        text = clipboard.text()
+        
+        if not text:
+            return
+        
+        # 如果有SSH连接，发送到服务器
+        if self.ssh_connection and self.ssh_connection.is_connected:
+            # 发送粘贴的文本到SSH服务器
+            self.ssh_connection.send_data(text)
+        else:
+            # 没有连接，使用默认粘贴行为
+            self.paste()
+    
