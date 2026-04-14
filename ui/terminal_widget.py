@@ -173,6 +173,21 @@ class TerminalWidget(QPlainTextEdit):
         if before_erase != self.receive_buffer:
             print(f"[DEBUG] 删除了行删除序列: {repr(before_erase)} -> {repr(self.receive_buffer)}")
         
+        # 重要: 在过滤控制字符之前,先处理OSC序列(因为OSC序列以\x07结尾)
+        # OSC序列格式: \x1b]<num>;<text>\x07 或 \x1b]<num>;<text>\x1b\
+        osc_pattern = re.compile(r'\x1b\].*?(?:\x1b\\|\x07)')
+        before_osc = self.receive_buffer
+        
+        # 调试: 检查OSC匹配
+        osc_matches = osc_pattern.findall(before_osc)
+        if osc_matches:
+            print(f"[DEBUG] OSC匹配结果: {osc_matches}")
+        
+        self.receive_buffer = osc_pattern.sub('', self.receive_buffer)
+        if before_osc != self.receive_buffer:
+            print(f"[DEBUG] 删除了OSC序列: {repr(before_osc)}")
+            print(f"[DEBUG] 删除后: {repr(self.receive_buffer)}")
+        
         # 移除控制字符(\x07 响铃等),但保留:
         # - \x08 退格(单独处理)
         # - \x0a 换行(LF)
@@ -250,17 +265,29 @@ class TerminalWidget(QPlainTextEdit):
             esc_pos = self.receive_buffer.rfind('\033')
             after_esc = self.receive_buffer[esc_pos:]
             
+            print(f"[DEBUG] 检查ANSI序列完整性: {repr(after_esc)}")
+            
             # 如果ESC后面没有完整的序列(以字母结尾),则等待
-            if not re.search(r'\033\[[0-9;]*[A-Za-z]', after_esc):
+            # 支持两种格式:
+            # 1. \033[<params><letter> - 标准CSI序列
+            # 2. \033[?<params><letter> - DEC私有序列
+            has_complete_sequence = re.search(r'\033\[\?[0-9;]*[A-Za-z]', after_esc) or \
+                                   re.search(r'\033\[[0-9;]*[A-Za-z]', after_esc)
+            
+            if not has_complete_sequence:
+                print(f"[DEBUG] 检测到不完整的ANSI序列,等待更多数据")
                 # 可能还有更多数据,暂时不处理
                 # 但为了避免卡住,设置一个最大等待时间
                 if len(self.receive_buffer) > 1000:
+                    print(f"[DEBUG] 缓冲区过大,强制处理")
                     pass  # 缓冲区太大,强制处理
                 else:
                     # 如果缓冲区包含普通文本(不仅仅是ESC序列),先处理
                     if len(self.receive_buffer) > len(after_esc):
+                        print(f"[DEBUG] 缓冲区有普通文本,继续处理")
                         pass  # 有普通文本,继续处理
                     else:
+                        print(f"[DEBUG] 缓冲区只有ESC序列,返回等待")
                         return
         
         # 处理缓冲区中的数据

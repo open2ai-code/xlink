@@ -70,15 +70,34 @@ class ANSIParser:
     
     def __init__(self):
         # ANSI转义序列正则表达式
-        # 匹配 \033[<params>m 格式
+        # 匹配 \033[<params>m 格式(SGR - Select Graphic Rendition)
         self.ansi_pattern = re.compile(r'\033\[([0-9;]*)m')
-        # 匹配光标移动等其他序列(简化处理,直接移除)
+        
+        # 匹配光标移动等其他CSI序列(CSI - Control Sequence Introducer)
+        # \033[<params><final-byte> 其中final-byte是 A-Z 或 a-z
         self.cursor_pattern = re.compile(r'\033\[[0-9;]*[A-Hf]')
+        
         # 匹配删除序列 \033[K (删除到行尾) \033[1K (删除到行首) \033[2K (删除整行)
         self.erase_pattern = re.compile(r'\033\[([0-2])?K')
+        
         # 匹配所有清屏序列 \033[<n>J
         self.clear_pattern = re.compile(r'\033\[([0-2])?J')
+        
+        # 匹配光标显示/隐藏 \033[?25h / \033[?25l
         self.hide_cursor = re.compile(r'\033\[\?25[hl]')
+        
+        # 匹配DEC私有序列 \033[?<params><letter>
+        # 例如: \033[?1034h (启用8位输入), \033[?1049h (备用屏幕)
+        self.dec_private_pattern = re.compile(r'\033\[\?[0-9;]*[hl]')
+        
+        # 匹配OSC序列 \033]<num>;<text>\033\ 或 \033]<num>;<text>\x07
+        # 例如: \033]0;标题\033\ (设置窗口标题), \033]10;前景色\x07
+        # 注意: 使用非贪婪匹配,确保匹配到第一个结束符
+        self.osc_pattern = re.compile(r'\033\].*?(?:\033\\|\x07)')
+        
+        # 匹配所有其他未处理的CSI序列
+        # \033[<params><final-byte>
+        self.csi_pattern = re.compile(r'\033\[[0-9;]*[A-Za-z]')
         
         # 当前样式状态
         self.reset_state()
@@ -113,6 +132,15 @@ class ANSIParser:
         print(f"[ANSI] 输入文本: {repr(text)}")
         print(f"[ANSI] 十六进制: {text.encode('utf-8').hex()}")
         
+        # 调试: 检查OSC序列
+        osc_matches = self.osc_pattern.findall(text)
+        if osc_matches:
+            print(f"[ANSI] 发现OSC序列: {osc_matches}")
+        
+        dec_matches = self.dec_private_pattern.findall(text)
+        if dec_matches:
+            print(f"[ANSI] 发现DEC序列: {dec_matches}")
+        
         # 检测清屏命令 - 支持所有格式
         # \033[J, \033[0J, \033[1J, \033[2J, \033[3J
         # 注意: 必须先检测组合序列(如 \033[H\033[2J),再检测单个序列
@@ -140,10 +168,34 @@ class ANSIParser:
         if not clear_found:
             print(f"[ANSI] 未检测到清屏命令")
         
-        # 移除不需要的控制序列
-        text = self.cursor_pattern.sub('', text)
-        text = self.erase_pattern.sub('', text)  # 移除删除序列
+        # 移除所有控制序列(按优先级顺序)
+        
+        # 1. 移除OSC序列(窗口标题等)
+        text_before = text
+        text = self.osc_pattern.sub('', text)
+        if text_before != text:
+            print(f"[ANSI] 过滤OSC: {repr(text_before)} -> {repr(text)}")
+        
+        # 2. 移除DEC私有序列
+        text_before = text
+        text = self.dec_private_pattern.sub('', text)
+        if text_before != text:
+            print(f"[ANSI] 过滤DEC: {repr(text_before)} -> {repr(text)}")
+        
+        # 3. 移除光标显示/隐藏
         text = self.hide_cursor.sub('', text)
+        
+        # 4. 移除清屏序列(已在上面处理,但再次确保)
+        text = self.clear_pattern.sub('', text)
+        
+        # 5. 移除删除序列
+        text = self.erase_pattern.sub('', text)
+        
+        # 6. 移除光标移动序列
+        text = self.cursor_pattern.sub('', text)
+        
+        # 7. 移除其他CSI序列
+        text = self.csi_pattern.sub('', text)
         
         # 分割ANSI序列
         parts = self.ansi_pattern.split(text)
