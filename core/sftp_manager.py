@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 SFTP文件管理模块
 封装paramiko的SFTPClient,提供文件传输和目录操作功能
@@ -352,3 +353,50 @@ class SFTPManager(QObject):
         except Exception as e:
             logger.error(f"切换目录失败: {e}")
             return False
+    
+    def get_directory_tree(self, start_path: str = "/") -> List[Dict]:
+        """
+        获取目录树结构(递归获取所有子目录)
+        
+        Args:
+            start_path: 起始路径
+            
+        Returns:
+            目录树列表,每个元素包含: name, path, children
+        """
+        if not self.is_connected:
+            return []
+        
+        try:
+            tree = []
+            self._build_directory_tree(start_path, tree)
+            return tree
+        except Exception as e:
+            logger.error(f"获取目录树失败: {e}")
+            return []
+    
+    def _build_directory_tree(self, path: str, tree_list: List[Dict]):
+        """
+        递归构建目录树
+        
+        Args:
+            path: 当前路径
+            tree_list: 树列表(输出)
+        """
+        try:
+            for attr in self.sftp_client.listdir_attr(path):
+                if stat.S_ISDIR(attr.st_mode):
+                    dir_name = attr.filename
+                    dir_path = path.rstrip('/') + '/' + dir_name
+                    
+                    node = {
+                        'name': dir_name,
+                        'path': dir_path,
+                        'children': []
+                    }
+                    tree_list.append(node)
+                    
+                    # 递归获取子目录
+                    self._build_directory_tree(dir_path, node['children'])
+        except Exception as e:
+            logger.debug(f"读取目录 {path} 失败: {e}")

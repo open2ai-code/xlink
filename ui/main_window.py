@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 主窗口模块
 整合所有UI组件,提供主界面布局
@@ -5,14 +6,16 @@
 
 from PyQt6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QMenuBar,
-    QToolBar, QMessageBox, QLabel
+    QToolBar, QMessageBox, QLabel, QTabWidget, QFrame, QVBoxLayout
 )
 from PyQt6.QtCore import Qt, QSize
 from PyQt6.QtGui import QAction, QFont
 from ui.theme import ThemeManager
 from ui.session_panel import SessionPanel
 from ui.tab_manager import TabManager
+from ui.sftp_window import SftpFileManager, SftpFileManagerWindow
 from core.session_manager import SessionManager
+from core.ssh_manager import SSHConnection
 
 
 class MainWindow(QMainWindow):
@@ -49,7 +52,7 @@ class MainWindow(QMainWindow):
         self.session_panel.setMinimumWidth(200)
         self.session_panel.setMaximumWidth(400)
         
-        # 右侧标签管理器
+        # 右侧终端标签管理器
         self.tab_manager = TabManager(
             font_size=self.session_manager.get_font_size()
         )
@@ -64,6 +67,9 @@ class MainWindow(QMainWindow):
         
         # 设置中央控件
         self.setCentralWidget(splitter)
+        
+        # SFTP文件管理器独立窗口
+        self.sftp_file_manager_window = None
         
         # 连接信号
         self.session_panel.session_connect.connect(self._connect_session)
@@ -152,6 +158,14 @@ class MainWindow(QMainWindow):
         
         toolbar.addSeparator()
         
+        # SFTP文件管理
+        sftp_action = QAction("📁 SFTP", self)
+        sftp_action.setToolTip("打开SFTP文件管理器窗口")
+        sftp_action.triggered.connect(self._open_sftp_file_manager)
+        toolbar.addAction(sftp_action)
+        
+        toolbar.addSeparator()
+        
         # 放大字体
         zoom_in_action = QAction("🔍+ 放大", self)
         zoom_in_action.setToolTip("放大字体")
@@ -233,7 +247,56 @@ class MainWindow(QMainWindow):
         Args:
             session_data: 会话数据
         """
+        # 创建终端标签页
         self.tab_manager.create_new_tab(session_data)
+        
+        # 获取刚创建的SSH连接
+        current_terminal = self.tab_manager.get_current_terminal()
+        if current_terminal and current_terminal in self.tab_manager.connections:
+            ssh_connection = self.tab_manager.connections[current_terminal]
+            
+            # 连接成功后打开SFTP文件管理器窗口
+            def on_connected(status):
+                if status == "connected":
+                    self._open_sftp_file_manager(ssh_connection)
+            
+            ssh_connection.connection_status.connect(on_connected)
+    
+    def _open_sftp_file_manager(self, ssh_connection=None):
+        """
+        打开SFTP文件管理器窗口
+        
+        Args:
+            ssh_connection: SSH连接对象(可选)
+        """
+        # 如果没有提供连接,尝试获取当前终端的连接
+        if not ssh_connection:
+            # 尝试获取当前选中的终端
+            current_terminal = self.tab_manager.get_current_terminal()
+            if current_terminal and current_terminal in self.tab_manager.connections:
+                ssh_connection = self.tab_manager.connections[current_terminal]
+            
+            # 如果当前终端没有连接,遍历所有连接找一个已连接的
+            if not ssh_connection or not ssh_connection.is_connected:
+                for terminal, connection in self.tab_manager.connections.items():
+                    if connection.is_connected:
+                        ssh_connection = connection
+                        break
+        
+        # 检查是否有活跃的连接
+        if not ssh_connection or not ssh_connection.is_connected:
+            QMessageBox.warning(self, "提示", "请先连接一个SSH会话")
+            return
+        
+        # 创建或显示SFTP文件管理器窗口
+        if not self.sftp_file_manager_window or not self.sftp_file_manager_window.isVisible():
+            self.sftp_file_manager_window = SftpFileManagerWindow(self, ssh_connection)
+        else:
+            self.sftp_file_manager_window.set_ssh_connection(ssh_connection)
+        
+        self.sftp_file_manager_window.show()
+        self.sftp_file_manager_window.raise_()
+        self.sftp_file_manager_window.activateWindow()
     
     def _new_session(self):
         """新建会话(通过会话面板处理)"""

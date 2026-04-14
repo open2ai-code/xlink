@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 生成XLink应用图标
 使用Pillow创建256x256的SSH终端图标

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 密码加密模块
 使用cryptography库对密码进行加密存储

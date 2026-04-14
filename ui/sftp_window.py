@@ -1,26 +1,31 @@
+# -*- coding: utf-8 -*-
 """
-SFTP文件管理面板
+SFTP文件管理模块
 提供可视化文件浏览、上传、下载、删除等功能
+包含：
+- SftpFileManager: SFTP文件管理核心组件
+- SftpFileManagerWindow: SFTP文件管理独立窗口
 """
 
 from PyQt6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QToolBar, QToolButton, QFileDialog, QMessageBox, QProgressBar,
-    QLabel, QHeaderView, QMenu
+    QLabel, QHeaderView, QMenu, QSplitter, QDockWidget, QDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QThread
 from PyQt6.QtGui import QAction, QIcon, QStandardItemModel, QStandardItem
 from datetime import datetime
 import os
+from typing import List, Dict
 from core.sftp_manager import SFTPManager
 from core.logger import get_logger
 
 
-logger = get_logger("SFTPPanel")
+logger = get_logger("SFTP")
 
 
-class SftpPanel(QFrame):
-    """SFTP文件管理面板"""
+class SftpFileManager(QFrame):
+    """SFTP文件管理核心组件"""
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,14 +47,34 @@ class SftpPanel(QFrame):
         # 工具栏
         self._create_toolbar(layout)
         
+        # 主分割器(树形目录 + 文件列表)
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
+        # 左侧: 树形目录
+        self._create_directory_tree(main_splitter)
+        
+        # 右侧: 文件列表区域
+        file_list_container = QFrame()
+        file_list_layout = QVBoxLayout(file_list_container)
+        file_list_layout.setContentsMargins(0, 0, 0, 0)
+        file_list_layout.setSpacing(0)
+        
         # 路径导航
-        self._create_path_bar(layout)
+        self._create_path_bar(file_list_layout)
         
         # 文件列表
-        self._create_file_list(layout)
+        self._create_file_list(file_list_layout)
         
         # 进度条
-        self._create_progress_bar(layout)
+        self._create_progress_bar(file_list_layout)
+        
+        main_splitter.addWidget(file_list_container)
+        
+        # 设置分割器比例: 树形目录占30%, 文件列表占70%
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 2)
+        
+        layout.addWidget(main_splitter)
     
     def _create_toolbar(self, layout):
         """创建工具栏"""
@@ -93,6 +118,107 @@ class SftpPanel(QFrame):
         toolbar.addAction(self.up_action)
         
         layout.addWidget(toolbar)
+    
+    def _create_directory_tree(self, parent):
+        """创建树形目录"""
+        # 创建目录树容器
+        tree_frame = QFrame()
+        tree_frame.setFrameShape(QFrame.Shape.StyledPanel)
+        tree_layout = QVBoxLayout(tree_frame)
+        tree_layout.setContentsMargins(2, 2, 2, 2)
+        tree_layout.setSpacing(2)
+        
+        # 添加标题
+        tree_label = QLabel("📂 目录结构")
+        tree_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; background-color: #2d2d30; color: #d4d4d4; }")
+        tree_layout.addWidget(tree_label)
+        
+        # 创建树形控件
+        self.dir_tree = QTreeWidget()
+        self.dir_tree.setHeaderLabels(["目录"])
+        self.dir_tree.header().setVisible(False)
+        self.dir_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        
+        # 点击目录切换
+        self.dir_tree.itemClicked.connect(self._on_dir_tree_clicked)
+        
+        # 双击展开/折叠
+        self.dir_tree.itemDoubleClicked.connect(self._on_dir_tree_double_clicked)
+        
+        tree_layout.addWidget(self.dir_tree)
+        
+        # 添加到父容器
+        parent.addWidget(tree_frame)
+    
+    def _load_directory_tree(self):
+        """加载目录树(懒加载模式)"""
+        if not self.sftp_manager.is_connected:
+            return
+        
+        # 清空树
+        self.dir_tree.clear()
+        
+        # 添加根节点
+        root_item = QTreeWidgetItem(self.dir_tree)
+        root_item.setText(0, "📁 /")
+        root_item.setData(0, Qt.ItemDataRole.UserRole, {"path": "/", "name": "/"})
+        root_item.setExpanded(True)
+        
+        # 只加载根目录的子目录(不递归)
+        self._load_children_for_node(root_item, "/")
+    
+    def _load_children_for_node(self, parent_item: QTreeWidgetItem, path: str):
+        """
+        为节点加载子目录(只加载一层)
+        
+        Args:
+            parent_item: 父节点
+            path: 父目录路径
+        """
+        try:
+            # 获取该目录下的子目录
+            items = self.sftp_manager.list_directory(path)
+            
+            # 过滤出目录项
+            for item in items:
+                if item['is_dir']:
+                    child_item = QTreeWidgetItem(parent_item)
+                    child_item.setText(0, f"📁 {item['name']}")
+                    child_path = path.rstrip('/') + '/' + item['name']
+                    child_item.setData(0, Qt.ItemDataRole.UserRole, {"path": child_path, "name": item['name']})
+                    
+                    # 标记为可展开(添加一个空子项作为占位符)
+                    dummy_item = QTreeWidgetItem(child_item)
+                    dummy_item.setText(0, "加载中...")
+        except Exception as e:
+            logger.error(f"加载子目录失败: {e}")
+    
+    def _on_dir_tree_clicked(self, item, column):
+        """点击目录树节点"""
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data and 'path' in data:
+            path = data['path']
+            # 切换到该目录
+            if self.sftp_manager.change_directory(path):
+                self.refresh()
+                self.path_edit.setText(path)
+    
+    def _on_dir_tree_double_clicked(self, item, column):
+        """双击目录树节点(展开/折叠 + 懒加载)"""
+        # 检查是否有"加载中..."的占位符
+        if item.childCount() == 1:
+            first_child = item.child(0)
+            if first_child.text(0) == "加载中...":
+                # 移除占位符
+                item.removeChild(first_child)
+                
+                # 加载实际的子目录
+                data = item.data(0, Qt.ItemDataRole.UserRole)
+                if data and 'path' in data:
+                    self._load_children_for_node(item, data['path'])
+        
+        # 切换展开/折叠状态
+        item.setExpanded(not item.isExpanded())
     
     def _create_path_bar(self, layout):
         """创建路径导航栏"""
@@ -206,6 +332,7 @@ class SftpPanel(QFrame):
                     self.sftp_manager.sftp_client = None
                 self.sftp_manager.is_connected = False
                 self.file_tree.clear()
+                self.dir_tree.clear()  # 清空目录树
                 self.path_edit.setText("/")
                 logger.info("SFTP已断开")
             except Exception as e:
@@ -219,6 +346,9 @@ class SftpPanel(QFrame):
         items = self.sftp_manager.list_directory()
         self._update_file_list(items)
         self.path_edit.setText(self.sftp_manager.get_current_path())
+        
+        # 更新目录树
+        self._load_directory_tree()
     
     def _update_file_list(self, items):
         """更新文件列表"""
@@ -443,6 +573,8 @@ class SftpPanel(QFrame):
         """连接成功"""
         logger.info("SFTP连接成功,开始刷新目录")
         self.refresh()
+        # 加载目录树
+        self._load_directory_tree()
         logger.info("目录刷新完成")
     
     def _on_disconnected(self):
@@ -460,3 +592,49 @@ class SftpPanel(QFrame):
             percent = int(current / total * 100)
             self.progress_bar.setValue(percent)
             self.progress_label.setText(f"传输中: {percent}%")
+
+
+class SftpFileManagerWindow(QDialog):
+    """SFTP文件管理独立窗口"""
+    
+    def __init__(self, parent=None, ssh_connection=None):
+        super().__init__(parent)
+        
+        self.ssh_connection = ssh_connection
+        
+        # 设置窗口属性
+        self.setWindowTitle("SFTP 文件管理器")
+        self.setMinimumSize(1000, 600)
+        self.resize(1200, 700)
+        
+        # 设置为独立窗口(不跟随父窗口)
+        self.setWindowFlags(Qt.WindowType.Window)
+        
+        # 创建SFTP文件管理器
+        self.file_manager = SftpFileManager(self)
+        
+        # 创建布局
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.file_manager)
+        
+        # 如果有SSH连接,立即连接
+        if ssh_connection and ssh_connection.is_connected:
+            self.file_manager.connect_session(ssh_connection)
+    
+    def set_ssh_connection(self, ssh_connection):
+        """
+        设置SSH连接
+        
+        Args:
+            ssh_connection: SSHConnection对象
+        """
+        self.ssh_connection = ssh_connection
+        if ssh_connection and ssh_connection.is_connected:
+            self.file_manager.connect_session(ssh_connection)
+    
+    def closeEvent(self, event):
+        """窗口关闭事件"""
+        # 断开SFTP连接
+        self.file_manager.disconnect()
+        event.accept()

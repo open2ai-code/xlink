@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 终端控件模块
 基于QPlainTextEdit实现的自定义SSH终端

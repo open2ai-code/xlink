@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """
 XLink - SSH客户端
 主入口程序
