@@ -68,7 +68,14 @@ class ANSIParser:
         107: "#FFFFFF",
     }
     
+    # 256色映射表
+    _256_COLOR_MAP = {}
+    
     def __init__(self):
+        # 初始化256色映射表（仅在第一次实例化时）
+        if not self.__class__._256_COLOR_MAP:
+            self._init_256_colors()
+        
         # ANSI转义序列正则表达式
         # 匹配 \033[<params>m 格式(SGR - Select Graphic Rendition)
         self.ansi_pattern = re.compile(r'\033\[([0-9;]*)m')
@@ -104,6 +111,25 @@ class ANSIParser:
         
         # 控制命令列表
         self.commands = []
+    
+    def _init_256_colors(self):
+        """初始化256色映射表"""
+        # 0-15: 标准颜色 (已在ANSI_COLORS和BG_COLORS中定义)
+        # 16-231: 6x6x6 色立方体
+        for r in range(6):
+            for g in range(6):
+                for b in range(6):
+                    idx = 16 + r * 36 + g * 6 + b
+                    # 将0-5映射到0-255
+                    red = 0 if r == 0 else 55 + r * 40
+                    green = 0 if g == 0 else 55 + g * 40
+                    blue = 0 if b == 0 else 55 + b * 40
+                    self.__class__._256_COLOR_MAP[idx] = f"#{red:02x}{green:02x}{blue:02x}"
+        
+        # 232-255: 灰度色阶 (从黑到白的24个灰度)
+        for i in range(24):
+            gray = 8 + i * 10
+            self.__class__._256_COLOR_MAP[232 + i] = f"#{gray:02x}{gray:02x}{gray:02x}"
     
     def reset_state(self):
         """重置样式状态"""
@@ -249,7 +275,11 @@ class ANSIParser:
         
         params = [int(p) for p in params_str.split(';') if p.isdigit()]
         
-        for param in params:
+        # 处理真彩色和256色需要连续读取多个参数
+        i = 0
+        while i < len(params):
+            param = params[i]
+            
             if param == 0:
                 # 重置所有样式
                 self.reset_state()
@@ -259,12 +289,38 @@ class ANSIParser:
             elif param == 4:
                 # 下划线
                 self.current_underline = True
+            elif param == 38 and i + 1 < len(params):
+                # 前景色扩展
+                if params[i + 1] == 5 and i + 2 < len(params):
+                    # 256色: 38;5;N
+                    color_idx = params[i + 2]
+                    self.current_fg = self._256_COLOR_MAP.get(color_idx, "#FFFFFF")
+                    i += 2
+                elif params[i + 1] == 2 and i + 4 < len(params):
+                    # 真彩色: 38;2;R;G;B
+                    r, g, b = params[i + 2], params[i + 3], params[i + 4]
+                    self.current_fg = f"#{r:02x}{g:02x}{b:02x}"
+                    i += 4
+            elif param == 48 and i + 1 < len(params):
+                # 背景色扩展
+                if params[i + 1] == 5 and i + 2 < len(params):
+                    # 256色: 48;5;N
+                    color_idx = params[i + 2]
+                    self.current_bg = self._256_COLOR_MAP.get(color_idx, "#000000")
+                    i += 2
+                elif params[i + 1] == 2 and i + 4 < len(params):
+                    # 真彩色: 48;2;R;G;B
+                    r, g, b = params[i + 2], params[i + 3], params[i + 4]
+                    self.current_bg = f"#{r:02x}{g:02x}{b:02x}"
+                    i += 4
             elif param in self.ANSI_COLORS:
-                # 前景色
+                # 标准前景色
                 self.current_fg = self.ANSI_COLORS[param]
             elif param in self.BG_COLORS:
-                # 背景色
+                # 标准背景色
                 self.current_bg = self.BG_COLORS[param]
+            
+            i += 1
     
     @staticmethod
     def strip_ansi(text: str) -> str:

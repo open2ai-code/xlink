@@ -219,6 +219,10 @@ class SSHConnection(QObject):
             # 设置channel超时
             self.channel.settimeout(1.0)
             
+            # 注意: 不禁用服务器回显
+            # 我们通过在终端控件中设置 ReadOnly=True 来阻止本地显示
+            # 所有显示都来自服务器的回显
+            
             # 更新状态
             self._set_state(self.STATE_CONNECTED)
             self._reconnect_attempts = 0
@@ -464,6 +468,9 @@ class SSHConnection(QObject):
         if not self.is_connected or not self.channel:
             logger.warning("连接未建立,无法发送数据")
             return
+        
+        # 调试: 记录发送的数据
+        print(f"[SEND DEBUG] 发送数据: {repr(data)}")
         
         try:
             # 直接发送(低延迟)
