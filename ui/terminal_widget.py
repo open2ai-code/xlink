@@ -157,21 +157,30 @@ class TerminalWidget(QPlainTextEdit):
             data: 从服务器接收的文本数据
         """
         # 调试: 打印接收到的原始数据
-        print(f"[DEBUG] 接收到数据: {repr(data)}")
+        print(f"[DEBUG] ===== 接收到数据 =====")
+        print(f"[DEBUG] 原始数据: {repr(data)}")
+        print(f"[DEBUG] 十六进制: {data.encode('utf-8').hex()}")
         
         # 将新数据添加到缓冲区
         self.receive_buffer += data
-        
-        # 调试: 打印原始数据
-        print(f"[DEBUG] 原始数据: {repr(self.receive_buffer)}")
+        print(f"[DEBUG] 合并后缓冲区: {repr(self.receive_buffer)}")
         
         # 先移除所有ANSI删除序列 (\x1b[K, \x1b[0K, \x1b[1K, \x1b[2K 等)
+        # 注意: 只删除 \x1b[...K (行删除),不删除 \x1b[...J (清屏)
         # 使用更宽松的正则,匹配所有 \x1b[...K 格式
-        original_buffer = self.receive_buffer
+        before_erase = self.receive_buffer
         self.receive_buffer = re.sub(r'\x1b\[[0-9;]*K', '', self.receive_buffer)
+        if before_erase != self.receive_buffer:
+            print(f"[DEBUG] 删除了行删除序列: {repr(before_erase)} -> {repr(self.receive_buffer)}")
         
-        if self.receive_buffer != original_buffer:
-            print(f"[DEBUG] 移除ANSI序列后: {repr(self.receive_buffer)}")
+        # 移除控制字符(\x07 响铃等),但保留:
+        # - \x08 退格(单独处理)
+        # - \x0a 换行(LF)
+        # - \x0d 回车(CR)
+        # - \x1b ESC(ANSI转义序列起始符)
+        # 过滤范围: \x00-\x06, \x07, \x09, \x0b-\x0c, \x0e-\x1a, \x1c-\x1f
+        # 注意: \x1b (ESC=27) 必须保留!
+        self.receive_buffer = re.sub(r'[\x00-\x06\x07\x09\x0b\x0c\x0e-\x1a\x1c-\x1f]', '', self.receive_buffer)
         
         # 然后处理退格字符 \x08
         if '\x08' in self.receive_buffer:
@@ -233,11 +242,6 @@ class TerminalWidget(QPlainTextEdit):
             
             self.receive_buffer = self._process_backspace(self.receive_buffer)
             print(f"[DEBUG] 处理后: {repr(self.receive_buffer)}")
-            
-            # 移除控制字符(\x07 响铃等)
-            self.receive_buffer = re.sub(r'[\x00-\x06\x07\x09-\x1f]', '', self.receive_buffer)
-            if self.receive_buffer:
-                print(f"[DEBUG] 移除控制字符后: {repr(self.receive_buffer)}")
         
         # 检查缓冲区是否包含完整的ANSI序列
         # 如果缓冲区以ESC开头但没有完整的序列,等待更多数据
@@ -264,18 +268,25 @@ class TerminalWidget(QPlainTextEdit):
         self.receive_buffer = ""
         
         print(f"[DEBUG] text_to_process: {repr(text_to_process)}, 长度: {len(text_to_process)}")
+        print(f"[DEBUG] text_to_process的十六进制: {text_to_process.encode('utf-8').hex()}")
         
         # 解析ANSI序列
         segments = self.ansi_parser.parse(text_to_process)
+        
+        # 调试: 打印解析后的命令
+        if self.ansi_parser.commands:
+            print(f"[DEBUG] 解析到的命令: {[cmd.command_type for cmd in self.ansi_parser.commands]}")
         
         # 处理控制命令
         for cmd in self.ansi_parser.commands:
             if cmd.command_type == 'clear_screen':
                 # 执行清屏
+                print(f"[DEBUG] 执行清屏操作")
                 self.clear()
                 # 清屏后需要重新设置 input_position
+                self.input_position = 0
                 self.need_set_input_position = True
-                print(f"[DEBUG] 清屏后需要重新设置 input_position")
+                print(f"[DEBUG] 清屏后重置 input_position 为 0")
                 # 不要return,继续处理剩余的文本(如提示符)
         
         # 如果有文本内容要显示(包括空格)
@@ -357,9 +368,88 @@ class TerminalWidget(QPlainTextEdit):
                 self.ssh_connection.send_data('\x08 \x08')  # 退格+空格+退格
             return
         
-        # Delete键 - 通常不发送到服务器,因为终端中很少用到
+        # Delete键 - 删除光标后字符
         if event.key() == Qt.Key.Key_Delete:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[3~')  # ANSI Delete
             return
+        
+        # Ctrl+X - 取消操作(很多编辑器使用)
+        if event.key() == Qt.Key.Key_X and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x18')  # Ctrl+X
+            return
+        
+        # Ctrl+Y - 恢复删除的文本(yank)
+        if event.key() == Qt.Key.Key_Y and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x19')  # Ctrl+Y
+            return
+        
+        # Ctrl+_ 或 Ctrl+/ - 撤销(Undo)
+        if event.key() in (Qt.Key.Key_Slash, Qt.Key.Key_Minus) and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1f')  # Ctrl+_
+            return
+        
+        # Alt+键处理(Alt通常转换为\x1b+字符)
+        if event.modifiers() & Qt.KeyboardModifier.AltModifier:
+            # Alt+F/B - 前进/后退一个单词
+            if event.key() == Qt.Key.Key_F:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1bf')  # Alt+F
+                return
+            if event.key() == Qt.Key.Key_B:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1bb')  # Alt+B
+                return
+            # Alt+D - 删除光标到单词末尾
+            if event.key() == Qt.Key.Key_D:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1bd')  # Alt+D
+                return
+            # Alt+Backspace - 删除光标前的单词
+            if event.key() == Qt.Key.Key_Backspace:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b\x7f')  # Alt+Backspace
+                return
+            # 其他Alt+字母
+            if event.key() >= Qt.Key.Key_A and event.key() <= Qt.Key.Key_Z:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    char = chr(event.key().value() - Qt.Key.Key_A.value() + ord('a'))
+                    self.ssh_connection.send_data('\x1b' + char)  # Alt+letter
+                return
+        
+        # Ctrl+方向键 - 按单词移动
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if event.key() == Qt.Key.Key_Left:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;5D')  # Ctrl+Left
+                return
+            if event.key() == Qt.Key.Key_Right:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;5C')  # Ctrl+Right
+                return
+            if event.key() == Qt.Key.Key_Up:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;5A')  # Ctrl+Up
+                return
+            if event.key() == Qt.Key.Key_Down:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;5B')  # Ctrl+Down
+                return
+            if event.key() == Qt.Key.Key_Delete:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[3;5~')  # Ctrl+Delete
+                return
+            if event.key() == Qt.Key.Key_Home:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;5H')  # Ctrl+Home
+                return
+            if event.key() == Qt.Key.Key_End:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;5F')  # Ctrl+End
+                return
         
         # Ctrl+C - 复制 或 发送中断信号
         if event.key() == Qt.Key.Key_C and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
@@ -382,9 +472,77 @@ class TerminalWidget(QPlainTextEdit):
         if event.key() == Qt.Key.Key_L and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.clear()
             self.input_position = self.document().characterCount() - 1
+            self.need_set_input_position = True
             return
         
-        # Left/Right箭头 - 移动到服务器
+        # Ctrl+D - 发送EOF(退出shell)
+        if event.key() == Qt.Key.Key_D and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x04')  # EOT
+            return
+        
+        # Ctrl+Z - 挂起进程
+        if event.key() == Qt.Key.Key_Z and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1a')  # SUSP
+            return
+        
+        # Ctrl+U - 删除整行
+        if event.key() == Qt.Key.Key_U and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x15')  # Ctrl+U
+            return
+        
+        # Ctrl+K - 删除光标到行尾
+        if event.key() == Qt.Key.Key_K and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x0b')  # Ctrl+K
+            return
+        
+        # Ctrl+W - 删除前一个单词
+        if event.key() == Qt.Key.Key_W and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x17')  # Ctrl+W
+            return
+        
+        # Ctrl+A - 光标移到行首
+        if event.key() == Qt.Key.Key_A and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x01')  # Ctrl+A
+            return
+        
+        # Ctrl+E - 光标移到行尾
+        if event.key() == Qt.Key.Key_E and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x05')  # Ctrl+E
+            return
+        
+        # Ctrl+R - 搜索历史命令
+        if event.key() == Qt.Key.Key_R and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x12')  # Ctrl+R
+            return
+        
+        # Shift+方向键 - 选择模式(终端可能支持)
+        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            if event.key() == Qt.Key.Key_Left:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;2D')  # Shift+Left
+                return
+            if event.key() == Qt.Key.Key_Right:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;2C')  # Shift+Right
+                return
+            if event.key() == Qt.Key.Key_Up:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;2A')  # Shift+Up
+                return
+            if event.key() == Qt.Key.Key_Down:
+                if self.ssh_connection and self.ssh_connection.is_connected:
+                    self.ssh_connection.send_data('\x1b[1;2B')  # Shift+Down
+                return
+        
+        # Left/Right箭头 - 移动光标
         if event.key() == Qt.Key.Key_Left:
             if self.ssh_connection and self.ssh_connection.is_connected:
                 self.ssh_connection.send_data('\x1b[D')  # ANSI左箭头
@@ -393,6 +551,17 @@ class TerminalWidget(QPlainTextEdit):
         if event.key() == Qt.Key.Key_Right:
             if self.ssh_connection and self.ssh_connection.is_connected:
                 self.ssh_connection.send_data('\x1b[C')  # ANSI右箭头
+            return
+        
+        # Up/Down箭头 - 上下移动(如果不是命令历史)
+        if event.key() == Qt.Key.Key_Up:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[A')  # ANSI上箭头
+            return
+        
+        if event.key() == Qt.Key.Key_Down:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[B')  # ANSI下箭头
             return
         
         # Home键
@@ -407,14 +576,83 @@ class TerminalWidget(QPlainTextEdit):
                 self.ssh_connection.send_data('\x1b[F')  # ANSI End
             return
         
+        # Page Up/Down
+        if event.key() == Qt.Key.Key_PageUp:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[5~')  # ANSI PageUp
+            return
+        
+        if event.key() == Qt.Key.Key_PageDown:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[6~')  # ANSI PageDown
+            return
+        
+        # Insert键
+        if event.key() == Qt.Key.Key_Insert:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[2~')  # ANSI Insert
+            return
+        
+        # F1-F12功能键
+        function_keys = {
+            Qt.Key.Key_F1: '\x1bOP',
+            Qt.Key.Key_F2: '\x1bOQ',
+            Qt.Key.Key_F3: '\x1bOR',
+            Qt.Key.Key_F4: '\x1bOS',
+            Qt.Key.Key_F5: '\x1b[15~',
+            Qt.Key.Key_F6: '\x1b[17~',
+            Qt.Key.Key_F7: '\x1b[18~',
+            Qt.Key.Key_F8: '\x1b[19~',
+            Qt.Key.Key_F9: '\x1b[20~',
+            Qt.Key.Key_F10: '\x1b[21~',
+            Qt.Key.Key_F11: '\x1b[23~',
+            Qt.Key.Key_F12: '\x1b[24~',
+        }
+        
+        if event.key() in function_keys:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data(function_keys[event.key()])
+            return
+        
+        # F13-F20功能键(一些终端支持)
+        extended_function_keys = {
+            Qt.Key.Key_F13: '\x1b[25~',
+            Qt.Key.Key_F14: '\x1b[26~',
+            Qt.Key.Key_F15: '\x1b[28~',
+            Qt.Key.Key_F16: '\x1b[29~',
+            Qt.Key.Key_F17: '\x1b[31~',
+            Qt.Key.Key_F18: '\x1b[32~',
+            Qt.Key.Key_F19: '\x1b[33~',
+            Qt.Key.Key_F20: '\x1b[34~',
+        }
+        
+        if event.key() in extended_function_keys:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data(extended_function_keys[event.key()])
+            return
+        
+        # Escape键
+        if event.key() == Qt.Key.Key_Escape:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b')  # ESC
+            return
+        
+        # Tab键 - 命令补全,发送到服务器
+        if event.key() == Qt.Key.Key_Tab:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\t')  # Tab字符
+            return
+        
+        # Shift+Tab - 反向补全
+        if event.key() == Qt.Key.Key_Tab and event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.send_data('\x1b[Z')  # Shift+Tab
+            return
+        
         # 空格键 - 特殊处理,因为event.text()可能为空
         if event.key() == Qt.Key.Key_Space:
-            print(f"[DEBUG] 检测到空格键")
             if self.ssh_connection and self.ssh_connection.is_connected:
-                print(f"[DEBUG] 发送空格到服务器")
                 self.ssh_connection.send_data(' ')
-            else:
-                print(f"[DEBUG] SSH未连接")
             return
         
         # 其他可打印字符 - 只发送到服务器,不本地显示

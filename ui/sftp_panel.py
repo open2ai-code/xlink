@@ -160,15 +160,27 @@ class SftpPanel(QFrame):
         Args:
             ssh_connection: SSHConnection对象
         """
-        if not ssh_connection or not ssh_connection.is_connected:
-            logger.error("SSH未连接,无法建立SFTP连接")
+        logger.info(f"开始连接SFTP会话")
+        
+        if not ssh_connection:
+            logger.error("SSH连接对象为空")
+            QMessageBox.critical(self, "错误", "SSH连接对象为空")
             return False
+            
+        if not ssh_connection.is_connected:
+            logger.error("SSH未连接,无法建立SFTP连接")
+            QMessageBox.critical(self, "错误", "SSH未连接,无法建立SFTP连接")
+            return False
+        
+        logger.info(f"SSH连接状态: {ssh_connection.is_connected}")
+        logger.info(f"SSH客户端: {ssh_connection.client}")
         
         self.current_session = ssh_connection
         
         # 使用SSH连接创建SFTP
         try:
             # 复用SSH连接
+            logger.info("正在打开SFTP通道...")
             self.sftp_manager.ssh_client = ssh_connection.client
             self.sftp_manager.sftp_client = ssh_connection.client.open_sftp()
             self.sftp_manager.is_connected = True
@@ -180,6 +192,8 @@ class SftpPanel(QFrame):
         except Exception as e:
             error_msg = f"SFTP连接失败: {str(e)}"
             logger.error(error_msg)
+            import traceback
+            logger.error(traceback.format_exc())
             QMessageBox.critical(self, "错误", error_msg)
             return False
     
@@ -427,7 +441,9 @@ class SftpPanel(QFrame):
     
     def _on_connected(self):
         """连接成功"""
+        logger.info("SFTP连接成功,开始刷新目录")
         self.refresh()
+        logger.info("目录刷新完成")
     
     def _on_disconnected(self):
         """连接断开"""

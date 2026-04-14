@@ -109,20 +109,36 @@ class ANSIParser:
         # 重置命令列表
         self.commands = []
         
+        print(f"[ANSI] ===== 开始解析 =====")
+        print(f"[ANSI] 输入文本: {repr(text)}")
+        print(f"[ANSI] 十六进制: {text.encode('utf-8').hex()}")
+        
         # 检测清屏命令 - 支持所有格式
         # \033[J, \033[0J, \033[1J, \033[2J, \033[3J
+        # 注意: 必须先检测组合序列(如 \033[H\033[2J),再检测单个序列
         clear_patterns = [
-            r'\033\[2J',   # 清屏
-            r'\033\[J',    # 清屏(无参数)
-            r'\033\[0J',   # 清屏
-            r'\033\[H\033\[2J',  # 光标归位+清屏
+            r'\033\[H\033\[2J',  # 光标归位+清屏(最常见)
+            r'\033\[H\033\[J',   # 光标归位+清屏(无参数)
+            r'\033\[2J',         # 清屏
+            r'\033\[J',          # 清屏(无参数)
+            r'\033\[0J',         # 清屏
+            r'\033\[3J',         # 清屏+清除滚动缓冲区
         ]
         
-        for pattern in clear_patterns:
-            if re.search(pattern, text):
+        clear_found = False
+        for i, pattern in enumerate(clear_patterns):
+            match = re.search(pattern, text)
+            if match:
+                print(f"[ANSI] 检测到清屏命令: {pattern}")
+                print(f"[ANSI] 匹配位置: {match.start()}-{match.end()}")
                 self.commands.append(TerminalCommand('clear_screen'))
                 text = re.sub(pattern, '', text)
+                print(f"[ANSI] 删除后文本: {repr(text)}")
+                clear_found = True
                 break
+        
+        if not clear_found:
+            print(f"[ANSI] 未检测到清屏命令")
         
         # 移除不需要的控制序列
         text = self.cursor_pattern.sub('', text)

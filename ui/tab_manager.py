@@ -3,10 +3,11 @@
 管理多终端标签页
 """
 
-from PyQt6.QtWidgets import QTabWidget, QMenu
+from PyQt6.QtWidgets import QTabWidget, QMenu, QSplitter, QFrame, QVBoxLayout
 from PyQt6.QtCore import pyqtSignal, Qt
 from PyQt6.QtGui import QAction
 from ui.terminal_widget import TerminalWidget
+from ui.sftp_panel import SftpPanel
 from core.ssh_manager import SSHConnection
 
 
@@ -43,30 +44,66 @@ class TabManager(QTabWidget):
         Args:
             session_data: 会话数据字典
         """
+        print(f"[TAB DEBUG] 创建新标签页: {session_data.get('name')}")
+        
+        # 创建容器框架
+        container = QFrame()
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        
+        # 创建水平分割器(终端 + SFTP)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        
         # 创建终端控件
         terminal = TerminalWidget(self.font_size)
+        terminal.setMinimumWidth(400)
+        
+        # 创建SFTP面板
+        sftp_panel = SftpPanel()
+        sftp_panel.setMinimumWidth(300)
+        print(f"[TAB DEBUG] SFTP面板已创建: {sftp_panel}")
+        
+        # 添加到分割器
+        splitter.addWidget(terminal)
+        splitter.addWidget(sftp_panel)
+        
+        # 设置初始比例 (2:1)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 1)
+        
+        container_layout.addWidget(splitter)
         
         # 创建SSH连接
         connection = SSHConnection()
         
-        # 连接信号
-        connection.connection_status.connect(
-            lambda status: self._on_connection_status(status, terminal)
-        )
+        # 连接信号 - 添加调试
+        def on_status(status):
+            print(f"[TAB DEBUG] 连接状态: {status}")
+            print(f"[TAB DEBUG] terminal: {terminal}")
+            print(f"[TAB DEBUG] sftp_panel: {sftp_panel}")
+            self._on_connection_status(status, terminal, sftp_panel)
+        
+        connection.connection_status.connect(on_status)
         connection.error_occurred.connect(
             lambda error: self._on_error(error, terminal)
         )
         
         # 保存连接引用
         self.connections[terminal] = connection
+        self.connections[sftp_panel] = connection  # SFTP也需要连接引用
         
         # 添加标签页
         tab_name = session_data.get("name", "未命名")
-        tab_index = self.addTab(terminal, f"🖥️ {tab_name}")
+        tab_index = self.addTab(container, f"🖥️ {tab_name}")
         self.setCurrentIndex(tab_index)
         
         # 设置终端的SSH连接
         terminal.set_ssh_connection(connection)
+        
+        # 设置SFTP面板的连接(稍后连接成功后设置)
+        sftp_panel.ssh_connection = connection
+        print(f"[TAB DEBUG] sftp_panel.ssh_connection 已设置: {sftp_panel.ssh_connection}")
         
         # 发起连接
         connection.connect(
@@ -80,26 +117,69 @@ class TabManager(QTabWidget):
         
         self.status_message.emit(f"正在连接到 {session_data.get('host')}...")
     
-    def _on_connection_status(self, status: str, terminal: TerminalWidget):
+    def _on_connection_status(self, status: str, terminal: TerminalWidget, sftp_panel: SftpPanel = None):
         """
         连接状态变化
-        
+            
         Args:
             status: 状态字符串 (connected/disconnected/error)
             terminal: 对应的终端控件
+            sftp_panel: 对应的SFTP面板
         """
-        tab_index = self.indexOf(terminal)
-        if tab_index == -1:
-            return
+        print(f"[SFTP STATUS DEBUG] _on_connection_status 被调用")
+        print(f"[SFTP STATUS DEBUG] status: {status}")
+        print(f"[SFTP STATUS DEBUG] sftp_panel: {sftp_panel}")
+        print(f"[SFTP STATUS DEBUG] sftp_panel is None: {sftp_panel is None}")
         
+        if sftp_panel:
+            print(f"[SFTP STATUS DEBUG] hasattr(sftp_panel, 'ssh_connection'): {hasattr(sftp_panel, 'ssh_connection')}")
+            if hasattr(sftp_panel, 'ssh_connection'):
+                print(f"[SFTP STATUS DEBUG] sftp_panel.ssh_connection: {sftp_panel.ssh_connection}")
+        
+        # 找到容器 - 修复: terminal.parent() 是 splitter, 需要再找一层
+        container = terminal.parent()  # 这是 splitter
+        if container:
+            container = container.parent()  # 这才是 container (QFrame)
+        
+        print(f"[SFTP STATUS DEBUG] terminal.parent(): {terminal.parent()}")
+        print(f"[SFTP STATUS DEBUG] container: {container}")
+        
+        tab_index = self.indexOf(container)
+        print(f"[SFTP STATUS DEBUG] tab_index: {tab_index}")
+        
+        if tab_index == -1:
+            print(f"[SFTP STATUS DEBUG] tab_index == -1, 返回")
+            return
+            
         if status == "connected":
             self.setTabText(tab_index, self.tabText(tab_index).replace("⏳", "✅"))
             self.status_message.emit("连接成功")
+            
+            # 连接成功后,初始化SFTP面板
+            if sftp_panel and hasattr(sftp_panel, 'ssh_connection'):
+                try:
+                    print(f"[SFTP DEBUG] 开始初始化SFTP面板")
+                    print(f"[SFTP DEBUG] sftp_panel: {sftp_panel}")
+                    print(f"[SFTP DEBUG] ssh_connection: {sftp_panel.ssh_connection}")
+                    print(f"[SFTP DEBUG] ssh_connection.is_connected: {sftp_panel.ssh_connection.is_connected if sftp_panel.ssh_connection else 'None'}")
+                    
+                    result = sftp_panel.connect_session(sftp_panel.ssh_connection)
+                    print(f"[SFTP DEBUG] connect_session 返回结果: {result}")
+                    
+                    if result:
+                        self.status_message.emit("SFTP已就绪")
+                    else:
+                        self.status_message.emit("SFTP初始化失败")
+                except Exception as e:
+                    print(f"[SFTP DEBUG] SFTP初始化异常: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.status_message.emit(f"SFTP初始化失败: {str(e)}")
         elif status == "disconnected":
             self.setTabText(tab_index, self.tabText(tab_index).replace("⏳", "❌"))
             self.status_message.emit("连接已断开")
         elif status == "error":
-            self.setTabText(tab_index, self.tabText(tab_index).replace("⏳", "⚠️"))
+            self.setTabText(tab_index, self.tabText(tab_index).replace("⏳", "️"))
     
     def _on_error(self, error: str, terminal: TerminalWidget):
         """
@@ -120,12 +200,18 @@ class TabManager(QTabWidget):
         Args:
             index: 标签页索引
         """
-        widget = self.widget(index)
+        container = self.widget(index)
         
         # 清理SSH连接
-        if widget in self.connections:
-            connection = self.connections[widget]
-            connection.disconnect()
+        # 遍历所有连接,找到属于这个容器的
+        widgets_to_remove = []
+        for widget, connection in list(self.connections.items()):
+            # 检查widget是否在这个容器中
+            if widget.parent() == container or widget.parent().parent() == container:
+                connection.disconnect()
+                widgets_to_remove.append(widget)
+        
+        for widget in widgets_to_remove:
             del self.connections[widget]
         
         # 移除标签页
@@ -184,7 +270,12 @@ class TabManager(QTabWidget):
     
     def get_current_terminal(self) -> TerminalWidget:
         """获取当前终端控件"""
-        return self.currentWidget()
+        container = self.currentWidget()
+        if container:
+            # 查找容器中的TerminalWidget
+            for child in container.findChildren(TerminalWidget):
+                return child
+        return None
     
     def set_font_size(self, size: int):
         """
