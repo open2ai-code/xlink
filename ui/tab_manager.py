@@ -44,7 +44,7 @@ class TabManager(QTabWidget):
         Args:
             session_data: 会话数据字典
         """
-        print(f"[TAB DEBUG] 创建新标签页: {session_data.get('name')}")
+        # print(f"[TAB DEBUG] 创建新标签页: {session_data.get('name')}")
         
         # 创建终端控件
         terminal = TerminalWidget(self.font_size)
@@ -201,18 +201,18 @@ class TabManager(QTabWidget):
     def get_current_terminal(self) -> TerminalWidget:
         """获取当前终端控件"""
         widget = self.currentWidget()
-        print(f"[TAB DEBUG] get_current_terminal: widget={widget}, type={type(widget).__name__ if widget else None}")
+        # print(f"[TAB DEBUG] get_current_terminal: widget={widget}, type={type(widget).__name__ if widget else None}")
         if widget:
             # 如果直接是 TerminalWidget
             if isinstance(widget, TerminalWidget):
-                print(f"[TAB DEBUG] 直接返回 TerminalWidget")
+                # print(f"[TAB DEBUG] 直接返回 TerminalWidget")
                 return widget
             # 如果在容器中，查找 TerminalWidget
             terminals = widget.findChildren(TerminalWidget)
             if terminals:
-                print(f"[TAB DEBUG] 在容器中找到 TerminalWidget")
+                # print(f"[TAB DEBUG] 在容器中找到 TerminalWidget")
                 return terminals[0]
-        print(f"[TAB DEBUG] 未找到 TerminalWidget，返回 None")
+        # print(f"[TAB DEBUG] 未找到 TerminalWidget，返回 None")
         return None
     
     def set_font_size(self, size: int):

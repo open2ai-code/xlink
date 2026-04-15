@@ -476,7 +476,7 @@ class SSHConnection(QObject):
             return
         
         # 调试: 记录发送的数据
-        print(f"[SEND DEBUG] 发送数据: {repr(data)}")
+        # print(f"[SEND DEBUG] 发送数据: {repr(data)}")
         
         try:
             # 直接发送(低延迟)

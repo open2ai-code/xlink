@@ -22,8 +22,12 @@ class TextSegment:
 @dataclass
 class TerminalCommand:
     """终端控制命令"""
-    command_type: str  # 'clear', 'move_cursor', etc.
-    params: dict = None  # 命令参数
+    command_type: str  # 'clear_screen', 'move_cursor', 'clear_line', etc.
+    params: dict = None  # {'row': 0, 'col': 0} for move_cursor
+    
+    def __post_init__(self):
+        if self.params is None:
+            self.params = {}
 
 
 class ANSIParser:
@@ -85,6 +89,19 @@ class ANSIParser:
         # \033[<params><final-byte> 其中final-byte是 A-Z 或 a-z
         self.cursor_pattern = re.compile(r'\033\[[0-9;]*[A-Hf]')
         
+        # 新增: 光标定位序列
+        self.cursor_position_pattern = re.compile(r'\033\[(\d+);(\d+)H')  # \033[row;colH
+        self.cursor_position_default_pattern = re.compile(r'\033\[H')  # \033[H (默认1;1)
+        
+        # 新增: 光标移动序列
+        self.cursor_up_pattern = re.compile(r'\033\[(\d+)A')  # \033[nA - 上移
+        self.cursor_down_pattern = re.compile(r'\033\[(\d+)B')  # \033[nB - 下移
+        self.cursor_forward_pattern = re.compile(r'\033\[(\d+)C')  # \033[nC - 右移
+        self.cursor_back_pattern = re.compile(r'\033\[(\d+)D')  # \033[nD - 左移
+        
+        # 新增: 清行序列
+        self.erase_line_pattern = re.compile(r'\033\[([0-2])?K')
+        
         # 匹配删除序列 \033[K (删除到行尾) \033[1K (删除到行首) \033[2K (删除整行)
         self.erase_pattern = re.compile(r'\033\[([0-2])?K')
         
@@ -97,6 +114,11 @@ class ANSIParser:
         # 匹配DEC私有序列 \033[?<params><letter>
         # 例如: \033[?1034h (启用8位输入), \033[?1049h (备用屏幕)
         self.dec_private_pattern = re.compile(r'\033\[\?[0-9;]*[hl]')
+        
+        # 匹配字符集选择序列 \033(<charset> 或 \033)<charset>
+        # 例如: \033(B (ASCII字符集), \033(0 (图形字符集)
+        # 这些序列在 top、vim 等命令中常见
+        self.charset_pattern = re.compile(r'\033[()][A-Z0-9]')
         
         # 匹配OSC序列 \033]<num>;<text>\033\ 或 \033]<num>;<text>\x07
         # 例如: \033]0;标题\033\ (设置窗口标题), \033]10;前景色\x07
@@ -139,7 +161,8 @@ class ANSIParser:
         self.current_bg = None
         self.current_bold = False
         self.current_underline = False
-        self.commands = []  # 重置命令列表
+        # 注意: 不在这里清空commands,否则会在处理颜色序列时丢失清屏命令
+        # self.commands = []  # 已移除
     
     def parse(self, text: str) -> List[TextSegment]:
         """
@@ -156,66 +179,118 @@ class ANSIParser:
         # 重置命令列表
         self.commands = []
         
-        print(f"[ANSI] ===== 开始解析 =====")
-        print(f"[ANSI] 输入文本: {repr(text)}")
-        print(f"[ANSI] 十六进制: {text.encode('utf-8').hex()}")
+        # 调试: 记录解析入口
+        # print(f"[ANSI] 开始解析, 文本长度: {len(text)}, 包含ESC: {'\\033' in text}")
         
         # 调试: 检查是否包含ANSI颜色序列
-        if '\033[' in text and 'm' in text:
-            print(f"[ANSI COLOR] ✅ 检测到ANSI颜色序列!")
-            color_matches = re.findall(r'\033\[[0-9;]*m', text)
-            if color_matches:
-                print(f"[ANSI COLOR] 颜色序列: {color_matches[:5]}...")  # 只显示前5个
+        # if '\033[' in text and 'm' in text:
+        #     print(f"[ANSI COLOR] ✅ 检测到ANSI颜色序列!")
+        #     color_matches = re.findall(r'\033\[[0-9;]*m', text)
+        #     if color_matches:
+        #         print(f"[ANSI COLOR] 颜色序列: {color_matches[:5]}...")  # 只显示前5个
         
         # 调试: 检查OSC序列
         osc_matches = self.osc_pattern.findall(text)
-        if osc_matches:
-            print(f"[ANSI] 发现OSC序列: {osc_matches}")
         
         dec_matches = self.dec_private_pattern.findall(text)
-        if dec_matches:
-            print(f"[ANSI] 发现DEC序列: {dec_matches}")
         
         # 检测清屏命令 - 支持所有格式
         # \033[J, \033[0J, \033[1J, \033[2J, \033[3J
         # 注意: 必须先检测组合序列(如 \033[H\033[2J),再检测单个序列
+        # top 命令常用的序列:
+        # - \033[H\033[2J: 光标归位+清屏（最常见）
+        # - \033[2J\033[H: 清屏+光标归位
+        # - \033[H: 仅光标归位（top 刷新时使用）
         clear_patterns = [
             r'\033\[H\033\[2J',  # 光标归位+清屏(最常见)
+            r'\033\[2J\033\[H',  # 清屏+光标归位
             r'\033\[H\033\[J',   # 光标归位+清屏(无参数)
             r'\033\[2J',         # 清屏
             r'\033\[J',          # 清屏(无参数)
             r'\033\[0J',         # 清屏
             r'\033\[3J',         # 清屏+清除滚动缓冲区
+            # 注意: \033[H 单独出现时视为刷新,不是清屏,移到后面单独处理
         ]
         
         clear_found = False
-        for i, pattern in enumerate(clear_patterns):
+        for pattern in clear_patterns:
             match = re.search(pattern, text)
             if match:
-                print(f"[ANSI] 检测到清屏命令: {pattern}")
-                print(f"[ANSI] 匹配位置: {match.start()}-{match.end()}")
                 self.commands.append(TerminalCommand('clear_screen'))
                 text = re.sub(pattern, '', text)
-                print(f"[ANSI] 删除后文本: {repr(text)}")
                 clear_found = True
-                break
+                print(f"[ANSI] ✅ 检测到清屏命令")
+                break  # 找到一个清屏命令就足够了
+        
+        # 如果上面没找到，但文本中有 \033[2J，也视为清屏
+        if not clear_found and '\033[2J' in text:
+            self.commands.append(TerminalCommand('clear_screen'))
+            text = re.sub(r'\033\[2J', '', text)
+            clear_found = True
+            print(f"[ANSI] ✅ 兜底检测到清屏命令")
+        
+        # 单独处理 \033[H (光标归位) - 视为屏幕刷新
+        if '\033[H' in text:
+            self.commands.append(TerminalCommand('refresh_screen'))
+            text = re.sub(r'\033\[H', '', text)
+            print(f"[ANSI] ✅ 检测到刷新命令 (光标归位)")
+        
+        # 新增: 检测光标定位序列 \033[row;colH
+        cursor_pos_matches = list(self.cursor_position_pattern.finditer(text))
+        for match in cursor_pos_matches:
+            row = int(match.group(1)) - 1  # ANSI是1-based,转换为0-based
+            col = int(match.group(2)) - 1
+            self.commands.append(TerminalCommand('move_cursor', {'row': row, 'col': col}))
+            # print(f"[ANSI] 光标定位: row={row}, col={col}")
+        text = self.cursor_position_pattern.sub('', text)
+        
+        # 新增: 检测光标移动序列
+        for match in self.cursor_up_pattern.finditer(text):
+            n = int(match.group(1)) if match.group(1) else 1
+            self.commands.append(TerminalCommand('cursor_up', {'n': n}))
+        text = self.cursor_up_pattern.sub('', text)
+        
+        for match in self.cursor_down_pattern.finditer(text):
+            n = int(match.group(1)) if match.group(1) else 1
+            self.commands.append(TerminalCommand('cursor_down', {'n': n}))
+        text = self.cursor_down_pattern.sub('', text)
+        
+        for match in self.cursor_forward_pattern.finditer(text):
+            n = int(match.group(1)) if match.group(1) else 1
+            self.commands.append(TerminalCommand('cursor_forward', {'n': n}))
+        text = self.cursor_forward_pattern.sub('', text)
+        
+        for match in self.cursor_back_pattern.finditer(text):
+            n = int(match.group(1)) if match.group(1) else 1
+            self.commands.append(TerminalCommand('cursor_back', {'n': n}))
+        text = self.cursor_back_pattern.sub('', text)
+        
+        # 新增: 检测清行命令 \033[K
+        for match in self.erase_line_pattern.finditer(text):
+            mode = int(match.group(1)) if match.group(1) else 0
+            self.commands.append(TerminalCommand('clear_line', {'mode': mode}))
+        text = self.erase_line_pattern.sub('', text)
         
         if not clear_found:
-            print(f"[ANSI] 未检测到清屏命令")
+            # print(f"[ANSI] 未检测到清屏命令")
+            pass
         
         # 移除所有控制序列(按优先级顺序)
         
         # 1. 移除OSC序列(窗口标题等)
         text_before = text
         text = self.osc_pattern.sub('', text)
-        if text_before != text:
-            print(f"[ANSI] 过滤OSC: {repr(text_before)} -> {repr(text)}")
+        # if text_before != text:
+        #     print(f"[ANSI] 过滤OSC: {repr(text_before)} -> {repr(text)}")
         
         # 2. 移除DEC私有序列
         text_before = text
         text = self.dec_private_pattern.sub('', text)
-        if text_before != text:
-            print(f"[ANSI] 过滤DEC: {repr(text_before)} -> {repr(text)}")
+        # if text_before != text:
+        #     print(f"[ANSI] 过滤DEC: {repr(text_before)} -> {repr(text)}")
+        
+        # 2.5. 移除字符集选择序列 (\033(B 等)
+        text = self.charset_pattern.sub('', text)
         
         # 3. 移除光标显示/隐藏
         text = self.hide_cursor.sub('', text)
@@ -243,10 +318,10 @@ class ANSIParser:
         parts = processed_parts
         
         # 调试: 打印split结果
-        print(f"[ANSI DEBUG] split后parts数量: {len(parts)}")
-        if len(parts) <= 20:  # 只在数量不多时打印
-            for idx, part in enumerate(parts):
-                print(f"[ANSI DEBUG] parts[{idx}]: {repr(part[:50])}{'...' if len(part) > 50 else ''}")
+        # print(f"[ANSI DEBUG] split后parts数量: {len(parts)}")
+        # if len(parts) <= 20:  # 只在数量不多时打印
+        #     for idx, part in enumerate(parts):
+        #         print(f"[ANSI DEBUG] parts[{idx}]: {repr(part[:50])}{'...' if len(part) > 50 else ''}")
         
         # parts交替包含: 文本, 参数, 文本, 参数...
         current_text = ""
