@@ -87,7 +87,7 @@ class ANSIParser:
         
         # 匹配光标移动等其他CSI序列(CSI - Control Sequence Introducer)
         # \033[<params><final-byte> 其中final-byte是 A-Z 或 a-z
-        self.cursor_pattern = re.compile(r'\033\[[0-9;]*[A-Hf]')
+        self.cursor_pattern = re.compile(r'\033\[[0-9;]*[A-Ha-z]')  # 修复: 包含G (\033[G 光标到行首)
         
         # 新增: 光标定位序列
         self.cursor_position_pattern = re.compile(r'\033\[(\d+);(\d+)H')  # \033[row;colH
@@ -322,6 +322,9 @@ class ANSIParser:
         # if len(parts) <= 20:  # 只在数量不多时打印
         #     for idx, part in enumerate(parts):
         #         print(f"[ANSI DEBUG] parts[{idx}]: {repr(part[:50])}{'...' if len(part) > 50 else ''}")
+        
+        # 调试: 打印最终解析结果
+        # print(f"[ANSI] 解析完成, segments数量: {len([p for p in parts if p])}, commands数量: {len(self.commands)}")
         
         # parts交替包含: 文本, 参数, 文本, 参数...
         current_text = ""

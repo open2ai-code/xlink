@@ -148,8 +148,11 @@ class VirtualScreen:
             elif char == '\r':
                 # 回车
                 self.cursor_col = 0
+            elif char == '\x08':  # Backspace退格
+                # 光标左移一格,但不删除字符(删除由服务器发送的空格处理)
+                self.move_cursor_back(1)
             elif ord(char) < 32 and char not in ('\t',):  # 过滤控制字符,保留制表符
-                # 忽略其他控制字符(如\x08退格、\x07响铃等)
+                # 忽略其他控制字符(如\x07响铃等)
                 continue
             else:
                 self.write_char(char, attrs)

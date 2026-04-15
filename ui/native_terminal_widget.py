@@ -96,6 +96,24 @@ class NativeTerminalWidget(QWidget):
         """失去焦点"""
         super().focusOutEvent(event)
     
+    def event(self, event):
+        """
+        重写event方法,拦截Tab键的默认焦点切换行为
+        确保Tab键传递给keyPressEvent处理
+        """
+        from PyQt6.QtCore import QEvent
+        
+        # 拦截KeyPress事件中的Tab键
+        if event.type() == QEvent.Type.KeyPress:
+            from PyQt6.QtGui import QKeyEvent
+            if isinstance(event, QKeyEvent):
+                if event.key() == Qt.Key.Key_Tab:
+                    # 直接处理Tab键,阻止Qt的默认焦点切换
+                    self.keyPressEvent(event)
+                    return True  # 事件已处理
+        
+        return super().event(event)
+    
     def set_font_size(self, size: int):
         """设置字体大小"""
         self.font_size = size
@@ -134,7 +152,7 @@ class NativeTerminalWidget(QWidget):
     def _on_ssh_data(self, data: str):
         """接收SSH数据"""
         # 调试:打印接收到的原始数据
-        # print(f"[SSH Data] 接收到 {len(data)} 字节, repr: {repr(data[:100])}")
+        print(f"[SSH Data] 接收到 {len(data)} 字节, repr: {repr(data[:200])}")
         
         self.receive_buffer += data
         
@@ -147,6 +165,35 @@ class NativeTerminalWidget(QWidget):
         
         # 清空缓冲区
         self.receive_buffer = ""
+        
+        # 先处理控制命令(如清屏),再写入文本
+        for cmd in self.ansi_parser.commands:
+            if cmd.command_type == 'clear_screen':
+                self.screen.clear_screen()
+                self._just_cleared_screen = True
+                self._is_ncurses_mode = False
+                self._refresh_count = 0
+            elif cmd.command_type == 'refresh_screen':
+                # 刷新屏幕(光标归位),不清除内容
+                self.screen.move_cursor(0, 0)
+            elif cmd.command_type == 'cursor_move':
+                self.screen.move_cursor(cmd.row, cmd.col)
+            elif cmd.command_type == 'clear_line':
+                # 处理清行命令(退格删除时会用到)
+                mode = cmd.params.get('mode', 0)
+                self.screen.clear_line(mode)
+            elif cmd.command_type == 'cursor_up':
+                n = cmd.params.get('n', 1)
+                self.screen.move_cursor_up(n)
+            elif cmd.command_type == 'cursor_down':
+                n = cmd.params.get('n', 1)
+                self.screen.move_cursor_down(n)
+            elif cmd.command_type == 'cursor_forward':
+                n = cmd.params.get('n', 1)
+                self.screen.move_cursor_forward(n)
+            elif cmd.command_type == 'cursor_back':
+                n = cmd.params.get('n', 1)
+                self.screen.move_cursor_back(n)
         
         # 去重:检测重复的提示符 - 智能版本
         for segment in segments:
@@ -184,16 +231,6 @@ class NativeTerminalWidget(QWidget):
                     'bold': segment.bold,
                     'underline': segment.underline
                 })
-        
-        # 处理控制命令
-        for cmd in self.ansi_parser.commands:
-            if cmd.command_type == 'clear_screen':
-                self.screen.clear_screen()
-                self._just_cleared_screen = True
-                self._is_ncurses_mode = False
-                self._refresh_count = 0
-            elif cmd.command_type == 'cursor_move':
-                self.screen.move_cursor(cmd.row, cmd.col)
         
         # NCURSES模式检测
         if len(self.screen.modified_rows) > 0:
@@ -372,6 +409,7 @@ class NativeTerminalWidget(QWidget):
         
         # Tab键
         if key == Qt.Key.Key_Tab:
+            print(f"[KeyPress] 发送Tab键到服务器")
             self.ssh_connection.send_data('\t')
             return
         
