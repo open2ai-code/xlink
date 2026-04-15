@@ -151,9 +151,6 @@ class NativeTerminalWidget(QWidget):
     
     def _on_ssh_data(self, data: str):
         """接收SSH数据"""
-        # 调试:打印接收到的原始数据
-        print(f"[SSH Data] 接收到 {len(data)} 字节, repr: {repr(data[:200])}")
-        
         self.receive_buffer += data
         
         # 解析ANSI序列
@@ -353,10 +350,7 @@ class NativeTerminalWidget(QWidget):
     
     def keyPressEvent(self, event):
         """处理键盘输入"""
-        print(f"[KeyPress] key={event.key()}, text={repr(event.text())}")
-        
         if not self.ssh_connection or not self.ssh_connection.is_connected:
-            print(f"[KeyPress] 跳过: 未连接")
             return
         
         key = event.key()
@@ -366,6 +360,7 @@ class NativeTerminalWidget(QWidget):
         # Enter键
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.ssh_connection.send_data('\r\n')
+            # TODO: 记录当前输入的命令到历史
             return
         
         # Backspace键
@@ -378,7 +373,7 @@ class NativeTerminalWidget(QWidget):
             self.ssh_connection.send_data('\x1b[3~')
             return
         
-        # 方向键
+        # 方向键 - 始终发送到服务器
         if key == Qt.Key.Key_Left:
             self.ssh_connection.send_data('\x1b[D')
             return
@@ -386,16 +381,11 @@ class NativeTerminalWidget(QWidget):
             self.ssh_connection.send_data('\x1b[C')
             return
         if key == Qt.Key.Key_Up:
-            # 优先处理命令历史
-            if modifiers == Qt.KeyboardModifier.NoModifier:
-                self._history_previous()
-                return
+            # 发送上方向键序列到服务器，由服务器处理历史记录
             self.ssh_connection.send_data('\x1b[A')
             return
         if key == Qt.Key.Key_Down:
-            if modifiers == Qt.KeyboardModifier.NoModifier:
-                self._history_next()
-                return
+            # 发送下方向键序列到服务器，由服务器处理历史记录
             self.ssh_connection.send_data('\x1b[B')
             return
         
@@ -409,7 +399,6 @@ class NativeTerminalWidget(QWidget):
         
         # Tab键
         if key == Qt.Key.Key_Tab:
-            print(f"[KeyPress] 发送Tab键到服务器")
             self.ssh_connection.send_data('\t')
             return
         
@@ -487,20 +476,41 @@ class NativeTerminalWidget(QWidget):
         if self.history_index < len(self.command_history) - 1:
             self.history_index += 1
             cmd = self.command_history[-(self.history_index + 1)]
-            # TODO: 发送到服务器并显示
-            self.ssh_connection.send_data('\x15')  # Ctrl+U 清行
-            self.ssh_connection.send_data(cmd)
+            # 清行并显示历史命令
+            self._clear_current_line()
+            self._display_text_on_screen(cmd)
     
     def _history_next(self):
         """下一条历史命令"""
         if self.history_index > 0:
             self.history_index -= 1
             cmd = self.command_history[-(self.history_index + 1)]
-            self.ssh_connection.send_data('\x15')  # Ctrl+U 清行
-            self.ssh_connection.send_data(cmd)
+            self._clear_current_line()
+            self._display_text_on_screen(cmd)
         elif self.history_index == 0:
             self.history_index = -1
-            self.ssh_connection.send_data('\x15')  # 清空
+            self._clear_current_line()
+    
+    def _clear_current_line(self):
+        """清空当前行内容"""
+        # 清除当前行的内容
+        for col in range(self.screen.cols):
+            self.screen.cells[self.screen.cursor_row][col].reset()
+        self.screen.modified_rows.add(self.screen.cursor_row)
+        self.screen.cursor_col = 0
+        self._render_timer.start(16)  # 触发重绘
+    
+    def _display_text_on_screen(self, text: str):
+        """在屏幕上显示文本（不发送到服务器）"""
+        # 将文本写入屏幕缓冲区
+        attrs = {
+            'fg': '#D4D4D4',  # 默认前景色
+            'bg': '#1E1E1E',  # 默认背景色
+            'bold': False,
+            'underline': False
+        }
+        self.screen.write_text(text, attrs)
+        self._render_timer.start(16)  # 触发重绘
     
     def _paste_from_clipboard(self):
         """从剪贴板粘贴"""
@@ -512,14 +522,56 @@ class NativeTerminalWidget(QWidget):
     
     def clear(self):
         """清屏"""
+        # 清除本地虚拟屏幕
         self.screen.clear_screen()
         self._scroll_position = 0
+        
+        # 向服务器发送清屏命令，确保服务器也知道屏幕已清除
+        if self.ssh_connection and self.ssh_connection.is_connected:
+            # 发送ANSI清屏序列: \033[2J (清屏) + \033[H (光标归位)
+            self.ssh_connection.send_data('\033[2J\033[H')
+        
+        # 触发重绘
         self.update()
+    
+    def append_data(self, data: str):
+        """
+        追加数据到终端显示(兼容旧接口)
+        
+        Args:
+            data: 要显示的文本数据
+        """
+        # 直接写入虚拟屏幕，使用默认属性
+        attrs = {
+            'fg': '#D4D4D4',  # 默认前景色
+            'bg': '#1E1E1E',  # 默认背景色
+            'bold': False,
+            'underline': False
+        }
+        self.screen.write_text(data, attrs)
+        self._render_timer.start(16)  # 触发重绘
     
     def resizeEvent(self, event):
         """窗口大小改变"""
         super().resizeEvent(event)
-        # 重新计算可见区域
+        
+        # 计算新的行列数
+        new_cols = self.width() // self.char_width
+        new_rows = self.height() // self.char_height
+        
+        # 确保至少有最小行列
+        new_cols = max(40, new_cols)
+        new_rows = max(10, new_rows)
+        
+        # 调整虚拟屏幕大小
+        if new_cols != self.screen.cols or new_rows != self.screen.rows:
+            self.screen.resize(new_rows, new_cols)
+            
+            # 通知SSH服务器新的终端大小
+            if self.ssh_connection and self.ssh_connection.is_connected:
+                self.ssh_connection.resize_terminal(new_cols, new_rows)
+        
+        # 重新计算可见区域并触发重绘
         self.update()
     
     def contextMenuEvent(self, event):

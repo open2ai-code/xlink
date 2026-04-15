@@ -1,35 +1,12 @@
 {
   "sessions": [
     {
-      "name": "10.72.12.70",
-      "group": "默认分组",
-      "host": "10.72.12.70",
+      "id": "f5089308-6c7a-4976-aa14-2566cca6b644",
+      "name": "111.229.182.64",
+      "host": "111.229.182.64",
       "port": 22,
       "username": "root",
-      "timeout": 30,
-      "auth_type": "password",
-      "password": "Z0FBQUFBQnAzMEtRV3F0QTlCUXBDYy1MeEphRkZpTEczajJ1RHdLQWE3VlE2TUl5eU1GSnVmb2RSVTVZOUNqMlN0OTh0WkpxSWJscW9TUThNVHZKNGt4RzI4S3dHMDZoT1lzY0RKV2Z6ckl5cDc1RGdXZ251NWM9",
-      "key_file": "",
-      "id": "91c981c3-325c-409b-a184-15fc37b7e5c3"
-    },
-    {
-      "id": "fb7fa8df-b523-4469-8541-f896f74b3d50",
-      "name": "10.72.12.701",
-      "host": "10.72.12.70",
-      "port": 22,
-      "username": "root",
-      "password": "Z0FBQUFBQnAzMEtRT2ZEWUx5ZUhpcTlLZFZXTExISkUzYkd5TWdUdGpuVGoxaGFxRXJHdjRiY3ZwaVgzOTRrLXRFcndnVGZzYWVURjhQQ0tWaWVmOGZUUHM2emdaWHY4a192TjZqWkF5SzhSMklpXzNYSTY1VWc9",
-      "auth_method": "password",
-      "key_path": "",
-      "remember": false
-    },
-    {
-      "id": "6a1462b9-0e8d-4d44-94da-79d8040a4ee6",
-      "name": "10.72.12.702",
-      "host": "10.72.12.70",
-      "port": 22,
-      "username": "root",
-      "password": "Z0FBQUFBQnAzMEtRQllrT3g4YnhzXzJMamZiS2pQc2pjRVJ1Q1ZlTkxXMDdrWGJwOHE1c1RDTThXUTNsMV94bmFVUjd5UHpaQUxVZ0R5VEExNW9BLVNtaW5hbXlrN3JlOFNrdkszQjJIMUQ2WW9zUzE1aVJLTUE9",
+      "password": "Z0FBQUFBQnAzMUw1ckhON2d6Uk9xRU1OTlJwWTQ4Yk5TMHl6SGd1ZENxVHBSS2MyYk1HcW40b0gyZHdsY0JwU2JXV3BaT3BRN185ODhhTjZSM05ZM3lwQXI2Z3ZqTXVjOWc9PQ==",
       "auth_method": "password",
       "key_path": "",
       "remember": false

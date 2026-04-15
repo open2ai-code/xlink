@@ -169,11 +169,9 @@ class VirtualScreen:
         """
         if mode == 2:
             # 清整个屏幕
-            print(f"[VirtualScreen] 清屏前,第0行第1个字符: {repr(self.cells[0][0].char)}")
             for row in range(self.rows):
                 for col in range(self.cols):
                     self.cells[row][col].reset()
-            print(f"[VirtualScreen] 清屏后,第0行第1个字符: {repr(self.cells[0][0].char)}")
             self.modified_rows = set(range(self.rows))
             self.cursor_row = 0
             self.cursor_col = 0
