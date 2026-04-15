@@ -34,3 +34,6 @@ Thumbs.db
 
 # 日志
 *.log
+
+# WorkBuddy 工作记忆（本地数据，不提交）
+.workbuddy/
