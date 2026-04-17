@@ -46,6 +46,7 @@ class VirtualScreen:
         self.cursor_row = 0
         self.cursor_col = 0
         self.modified_rows: Set[int] = set()  # 追踪修改的行,用于增量渲染
+        self.modified_cols: dict = {}  # 追踪每行修改的列范围 {row: (min_col, max_col)}
         
         # 滚动区域(默认整个屏幕)
         self.scroll_top = 0
@@ -117,6 +118,13 @@ class VirtualScreen:
         # 标记此行已修改
         self.modified_rows.add(self.cursor_row)
         
+        # 更新修改的列范围
+        if self.cursor_row not in self.modified_cols:
+            self.modified_cols[self.cursor_row] = [self.cursor_col, self.cursor_col]
+        else:
+            self.modified_cols[self.cursor_row][0] = min(self.modified_cols[self.cursor_row][0], self.cursor_col)
+            self.modified_cols[self.cursor_row][1] = max(self.modified_cols[self.cursor_row][1], self.cursor_col)
+        
         # 光标右移
         self.cursor_col += 1
         if self.cursor_col >= self.cols:
@@ -166,6 +174,7 @@ class VirtualScreen:
                 0: 从光标到屏幕底部
                 1: 从屏幕顶部到光标
                 2: 整个屏幕(默认)
+                3: 整个屏幕+清除滚动缓冲区
         """
         if mode == 2:
             # 清整个屏幕
@@ -173,6 +182,7 @@ class VirtualScreen:
                 for col in range(self.cols):
                     self.cells[row][col].reset()
             self.modified_rows = set(range(self.rows))
+            self.modified_cols = {r: [0, self.cols - 1] for r in range(self.rows)}
             self.cursor_row = 0
             self.cursor_col = 0
         elif mode == 0:
@@ -181,12 +191,19 @@ class VirtualScreen:
             for col in range(self.cursor_col, self.cols):
                 self.cells[self.cursor_row][col].reset()
             self.modified_rows.add(self.cursor_row)
+            # 更新修改的列范围
+            if self.cursor_row not in self.modified_cols:
+                self.modified_cols[self.cursor_row] = [self.cursor_col, self.cols - 1]
+            else:
+                self.modified_cols[self.cursor_row][0] = min(self.modified_cols[self.cursor_row][0], self.cursor_col)
+                self.modified_cols[self.cursor_row][1] = max(self.modified_cols[self.cursor_row][1], self.cols - 1)
             
             # 再清除下面的所有行
             for row in range(self.cursor_row + 1, self.rows):
                 for col in range(self.cols):
                     self.cells[row][col].reset()
                 self.modified_rows.add(row)
+                self.modified_cols[row] = [0, self.cols - 1]
         elif mode == 1:
             # 从屏幕顶部到光标
             # 先清除上面的所有行
@@ -194,11 +211,18 @@ class VirtualScreen:
                 for col in range(self.cols):
                     self.cells[row][col].reset()
                 self.modified_rows.add(row)
+                self.modified_cols[row] = [0, self.cols - 1]
             
             # 再清除光标所在行的左侧
             for col in range(0, self.cursor_col + 1):
                 self.cells[self.cursor_row][col].reset()
             self.modified_rows.add(self.cursor_row)
+            # 更新修改的列范围
+            if self.cursor_row not in self.modified_cols:
+                self.modified_cols[self.cursor_row] = [0, self.cursor_col]
+            else:
+                self.modified_cols[self.cursor_row][0] = min(self.modified_cols[self.cursor_row][0], 0)
+                self.modified_cols[self.cursor_row][1] = max(self.modified_cols[self.cursor_row][1], self.cursor_col)
     
     def clear_line(self, mode: int = 0):
         """
@@ -214,14 +238,27 @@ class VirtualScreen:
             # 从光标到行尾
             for col in range(self.cursor_col, self.cols):
                 self.cells[self.cursor_row][col].reset()
+            # 更新修改的列范围
+            if self.cursor_row not in self.modified_cols:
+                self.modified_cols[self.cursor_row] = [self.cursor_col, self.cols - 1]
+            else:
+                self.modified_cols[self.cursor_row][0] = min(self.modified_cols[self.cursor_row][0], self.cursor_col)
+                self.modified_cols[self.cursor_row][1] = max(self.modified_cols[self.cursor_row][1], self.cols - 1)
         elif mode == 1:
             # 从行首到光标
             for col in range(0, self.cursor_col + 1):
                 self.cells[self.cursor_row][col].reset()
+            # 更新修改的列范围
+            if self.cursor_row not in self.modified_cols:
+                self.modified_cols[self.cursor_row] = [0, self.cursor_col]
+            else:
+                self.modified_cols[self.cursor_row][0] = min(self.modified_cols[self.cursor_row][0], 0)
+                self.modified_cols[self.cursor_row][1] = max(self.modified_cols[self.cursor_row][1], self.cursor_col)
         elif mode == 2:
             # 整行
             for col in range(self.cols):
                 self.cells[self.cursor_row][col].reset()
+            self.modified_cols[self.cursor_row] = [0, self.cols - 1]
         
         self.modified_rows.add(self.cursor_row)
     
@@ -276,22 +313,27 @@ class VirtualScreen:
         self.scroll_top = max(0, min(top, self.rows - 1))
         self.scroll_bottom = max(self.scroll_top, min(bottom, self.rows - 1))
     
-    def get_modified_rows_data(self) -> List[Tuple[int, List[Cell]]]:
+    def get_modified_rows_data(self) -> List[Tuple[int, List[Cell], Optional[Tuple[int, int]]]]:
         """
         获取修改过的行数据,用于渲染
         
         Returns:
-            [(行号, [Cell, Cell, ...]), ...]
+            [(行号, [Cell, Cell, ...], (min_col, max_col)), ...]
             注意: 返回Cell对象的深拷贝,避免后续修改影响渲染
+            (min_col, max_col) 是修改的列范围,如果为None表示整行都修改了
         """
         result = []
         for row_idx in sorted(self.modified_rows):
             # 创建Cell对象的深拷贝
             copied_cells = [Cell(cell.char, cell.fg_color, cell.bg_color, cell.bold, cell.underline) 
                           for cell in self.cells[row_idx]]
-            result.append((row_idx, copied_cells))
+            
+            # 获取修改的列范围
+            col_range = self.modified_cols.get(row_idx)
+            result.append((row_idx, copied_cells, col_range))
         
         self.modified_rows.clear()
+        self.modified_cols.clear()
         self._render_count += 1
         return result
     
@@ -325,6 +367,7 @@ class VirtualScreen:
         
         # 标记所有行为已修改
         self.modified_rows = set(range(rows))
+        self.modified_cols = {r: [0, cols - 1] for r in range(rows)}
         
         # 调整光标位置
         self.cursor_row = min(self.cursor_row, rows - 1)

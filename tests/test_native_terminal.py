@@ -333,8 +333,8 @@ class TestVirtualScreen:
         modified = self.screen.get_modified_rows_data()
         assert len(modified) > 0
         
-        # 验证是深拷贝
-        row_idx, cells = modified[0]
+        # 验证是深拷贝（返回值现在是3个值：row_idx, cells, col_range）
+        row_idx, cells, col_range = modified[0]
         cells[0].char = 'X'
         assert self.screen.cells[row_idx][0].char == 'A'  # 原数据未改变
     

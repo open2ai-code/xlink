@@ -180,6 +180,9 @@ class ANSIParser:
         # 重置命令列表
         self.commands = []
         
+        # 初始化清屏标志
+        clear_found = False
+        
         # 调试: 记录解析入口
         # print(f"[ANSI] 开始解析, 文本长度: {len(text)}, 包含ESC: {'\\033' in text}")
         
@@ -199,30 +202,37 @@ class ANSIParser:
         # - \033[H\033[2J: 光标归位+清屏（最常见）
         # - \033[2J\033[H: 清屏+光标归位
         # - \033[H: 仅光标归位（top 刷新时使用）
-        clear_patterns = [
-            r'\033\[H\033\[2J',  # 光标归位+清屏(最常见)
-            r'\033\[2J\033\[H',  # 清屏+光标归位
-            r'\033\[H\033\[J',   # 光标归位+清屏(无参数)
-            r'\033\[2J',         # 清屏
-            r'\033\[J',          # 清屏(无参数)
-            r'\033\[0J',         # 清屏
-            r'\033\[3J',         # 清屏+清除滚动缓冲区
-            # 注意: \033[H 单独出现时视为刷新,不是清屏,移到后面单独处理
-        ]
         
-        clear_found = False
-        for pattern in clear_patterns:
-            match = re.search(pattern, text)
-            if match:
-                self.commands.append(TerminalCommand('clear_screen'))
-                text = re.sub(pattern, '', text)
-                clear_found = True
-                break  # 找到一个清屏命令就足够了
+        # 使用正则表达式提取清屏模式
+        clear_screen_pattern = re.compile(r'\033\[([0-3])?J')
+        clear_matches = list(clear_screen_pattern.finditer(text))
         
-        # 如果上面没找到，但文本中有 \033[2J，也视为清屏
-        if not clear_found and '\033[2J' in text:
-            self.commands.append(TerminalCommand('clear_screen'))
-            text = re.sub(r'\033\[2J', '', text)
+        if clear_matches:
+            # 获取最后一个清屏命令的模式（通常是最重要的）
+            last_match = clear_matches[-1]
+            mode_str = last_match.group(1)
+            mode = int(mode_str) if mode_str else 0  # 默认为0（从光标到屏幕底部）
+            
+            self.commands.append(TerminalCommand('clear_screen', {'mode': mode}))
+            
+            # 移除所有清屏序列
+            text = clear_screen_pattern.sub('', text)
+            clear_found = True
+        
+        # 检测组合序列：光标归位+清屏
+        cursor_home_clear_pattern = re.compile(r'\033\[H\033\[([0-3])?J')
+        combo_matches = list(cursor_home_clear_pattern.finditer(text))
+        
+        if combo_matches:
+            last_match = combo_matches[-1]
+            mode_str = last_match.group(1)
+            mode = int(mode_str) if mode_str else 2  # 组合序列默认为2（整个屏幕）
+            
+            # 先清屏，后光标归位
+            self.commands.append(TerminalCommand('clear_screen', {'mode': mode}))
+            self.commands.append(TerminalCommand('refresh_screen'))
+            
+            text = cursor_home_clear_pattern.sub('', text)
             clear_found = True
         
         # 单独处理 \033[H (光标归位) - 视为屏幕刷新

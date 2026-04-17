@@ -66,18 +66,38 @@ class NativeTerminalWidget(QWidget):
         self._scroll_position = 0  # 滚动偏移(行)
         self._just_cleared_screen = False
         
-        # 命令历史
-        self.command_history = []
+        # 命令历史管理（本地历史）
+        self.command_history = []  # 本地执行的命令历史
         self.history_index = -1
+        self.current_input_buffer = ""  # 当前输入缓冲区（用于历史导航）
+        
+        # 提示符检测
+        self.prompt_pattern = None  # 动态检测到的提示符模式
+        self.last_prompt = ""  # 最后一次检测到的提示符
+        self.prompt_detection_enabled = True
         
         # 颜色配置标志
         self._color_config_sent = False
+        
+        # 清屏状态跟踪
+        self._clear_screen_pending = False  # 清屏操作是否正在进行
+        self._clear_screen_mode = 2  # 默认清屏模式（整个屏幕）
+        
+        # 增量渲染优化
+        self._needs_full_render = True  # 是否需要完整渲染
+        self._render_region = None  # 渲染区域 (min_row, max_row)
+        self._last_rendered_rows = set()  # 上次渲染的行
         
         # 渲染优化
         self._is_rendering = False
         self._render_timer = QTimer(self)
         self._render_timer.setSingleShot(True)
-        self._render_timer.timeout.connect(self.update)
+        self._render_timer.timeout.connect(self._delayed_render)
+        self._pending_render = False
+        self._last_render_time = 0
+        self._min_render_interval = 16  # 最小渲染间隔（60fps）
+        self._batch_update_count = 0
+        self._max_batch_updates = 5  # 最大批量更新次数
         
         # 提示: 自动更新控件大小
         self.setMinimumSize(800, 600)
@@ -166,10 +186,9 @@ class NativeTerminalWidget(QWidget):
         # 先处理控制命令(如清屏),再写入文本
         for cmd in self.ansi_parser.commands:
             if cmd.command_type == 'clear_screen':
-                self.screen.clear_screen()
-                self._just_cleared_screen = True
-                self._is_ncurses_mode = False
-                self._refresh_count = 0
+                # 获取清屏模式
+                mode = cmd.params.get('mode', 2)
+                self._handle_clear_screen(mode)
             elif cmd.command_type == 'refresh_screen':
                 # 刷新屏幕(光标归位),不清除内容
                 self.screen.move_cursor(0, 0)
@@ -192,36 +211,13 @@ class NativeTerminalWidget(QWidget):
                 n = cmd.params.get('n', 1)
                 self.screen.move_cursor_back(n)
         
-        # 去重:检测重复的提示符 - 智能版本
+        # 写入文本数据
         for segment in segments:
             if segment.text:
-                # 检查是否是纯提示符(可能带\r\n前缀)
-                stripped = segment.text.strip()
-                if stripped.count('[root@') > 1 and len(stripped) < 100:
-                    # 这是重复的提示符,只保留第一个
-                    first_prompt = segment.text.find('[root@')
-                    second_prompt = segment.text.find('[root@', first_prompt + 1)
-                    
-                    # 找到第二个提示符之前的换行符
-                    first_prompt_end = second_prompt
-                    for i in range(second_prompt - 1, first_prompt, -1):
-                        if segment.text[i] == '\n':
-                            end_pos = i
-                            if i > 0 and segment.text[i-1] == '\r':
-                                end_pos = i - 1
-                            first_prompt_end = end_pos
-                            break
-                    
-                    text_to_write = segment.text[:first_prompt_end]
-                    self.screen.write_text(text_to_write, {
-                        'fg': segment.fg_color or '#D4D4D4',
-                        'bg': segment.bg_color or '#1E1E1E',
-                        'bold': segment.bold,
-                        'underline': segment.underline
-                    })
-                    continue
+                # 检测并记录提示符
+                self._detect_and_record_prompt(segment.text)
                 
-                # 正常写入
+                # 正常写入文本
                 self.screen.write_text(segment.text, {
                     'fg': segment.fg_color or '#D4D4D4',
                     'bg': segment.bg_color or '#1E1E1E',
@@ -237,8 +233,8 @@ class NativeTerminalWidget(QWidget):
             # 提示符检测
             self._check_prompt()
             
-            # 触发重绘
-            self._render_timer.start(16)  # 60fps
+            # 触发批量渲染
+            self._schedule_render()
         
         # 重置ANSI解析器状态
         self.ansi_parser.reset_state()
@@ -284,6 +280,154 @@ class NativeTerminalWidget(QWidget):
                 self.cursor_visible = True
                 self._refresh_count = 0
     
+    def _detect_and_record_prompt(self, text: str):
+        """
+        检测并记录提示符
+        
+        Args:
+            text: 接收到的文本数据
+        """
+        if not self.prompt_detection_enabled:
+            return
+            
+        import re
+        
+        # 常见的提示符模式
+        prompt_patterns = [
+            r'\[.*?@.*?\].*?[#$]',  # [user@host path]# 或 $
+            r'.*?[#$]\s*$',          # 以#或$结尾的提示符
+            r'[a-zA-Z0-9_]+@[a-zA-Z0-9_]+.*?[#$]',  # user@host# 格式
+            r'[a-zA-Z0-9_]+%.*?$',   # zsh默认提示符
+        ]
+        
+        # 按行检查
+        lines = text.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # 尝试匹配提示符模式
+            for pattern in prompt_patterns:
+                match = re.search(pattern, line)
+                if match:
+                    prompt = match.group(0).strip()
+                    # 验证是否为有效的提示符
+                    if len(prompt) < 100 and ('#' in prompt or '$' in prompt or '%' in prompt):
+                        self.last_prompt = prompt
+                        # 更新提示符模式
+                        if not self.prompt_pattern or prompt != self.last_prompt:
+                            self.prompt_pattern = pattern
+                        return
+    
+    def _schedule_render(self):
+        """调度渲染 - 实现批量更新和延迟渲染"""
+        current_time = time.time() * 1000  # ms
+        time_since_last_render = current_time - self._last_render_time
+        
+        # 如果距离上次渲染时间很短，累积更新
+        if time_since_last_render < self._min_render_interval:
+            self._batch_update_count += 1
+            
+            # 如果达到最大批量更新次数，立即渲染
+            if self._batch_update_count >= self._max_batch_updates:
+                self._perform_render()
+                return
+        
+        # 否则延迟渲染
+        self._pending_render = True
+        self._render_timer.start(self._min_render_interval)
+    
+    def _delayed_render(self):
+        """延迟渲染处理"""
+        if self._pending_render:
+            self._perform_render()
+    
+    def _perform_render(self):
+        """执行实际的渲染"""
+        current_time = time.time() * 1000
+        
+        # 检查是否满足最小渲染间隔
+        if current_time - self._last_render_time >= self._min_render_interval:
+            self.update()
+            self._last_render_time = current_time
+            self._batch_update_count = 0
+            self._pending_render = False
+    
+    def _handle_clear_screen(self, mode: int = 2):
+        """
+        处理清屏命令 - 确保本地和服务器端状态同步
+        
+        Args:
+            mode: 清屏模式
+                0: 从光标到屏幕底部
+                1: 从屏幕顶部到光标
+                2: 整个屏幕(默认)
+                3: 整个屏幕+清除滚动缓冲区
+        """
+        # 标记清屏操作正在进行
+        self._clear_screen_pending = True
+        self._clear_screen_mode = mode
+        
+        # 执行本地清屏
+        self.screen.clear_screen(mode)
+        
+        # 重置相关状态
+        self._just_cleared_screen = True
+        self._is_ncurses_mode = False
+        self._refresh_count = 0
+        
+        # 重置滚动位置
+        if mode == 2 or mode == 3:
+            self._scroll_position = 0
+        
+        # 标记清屏完成
+        self._clear_screen_pending = False
+        
+        # 标记需要完整渲染
+        self._needs_full_render = True
+    
+    def clear(self, mode: int = 2):
+        """
+        清屏 - 主动触发清屏（用户操作）
+        
+        Args:
+            mode: 清屏模式，默认2（整个屏幕）
+        """
+        # 清除本地虚拟屏幕
+        self.screen.clear_screen(mode)
+        
+        # 重置滚动位置
+        if mode == 2 or mode == 3:
+            self._scroll_position = 0
+        
+        # 向服务器发送清屏命令，确保服务器端状态同步
+        if self.ssh_connection and self.ssh_connection.is_connected:
+            # 根据模式发送不同的ANSI清屏序列
+            if mode == 0:
+                # 从光标到屏幕底部
+                self.ssh_connection.send_data('\033[J')
+            elif mode == 1:
+                # 从屏幕顶部到光标
+                self.ssh_connection.send_data('\033[1J')
+            elif mode == 2:
+                # 整个屏幕 + 光标归位
+                self.ssh_connection.send_data('\033[2J\033[H')
+            elif mode == 3:
+                # 整个屏幕 + 清除滚动缓冲区 + 光标归位
+                self.ssh_connection.send_data('\033[3J\033[2J\033[H')
+        
+        # 重置相关状态
+        self._just_cleared_screen = True
+        self._is_ncurses_mode = False
+        self._refresh_count = 0
+        
+        # 标记需要完整渲染
+        self._needs_full_render = True
+        
+        # 触发重绘
+        self.update()
+    
     def _toggle_cursor(self):
         """切换光标可见性(闪烁)"""
         if not self._is_ncurses_mode:
@@ -291,26 +435,70 @@ class NativeTerminalWidget(QWidget):
             self.update()
     
     def paintEvent(self, event):
-        """自绘核心 - 直接绘制到QWidget"""
+        """自绘核心 - 直接绘制到QWidget（增量渲染优化版）"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         
-        # 1. 绘制背景
-        painter.fillRect(self.rect(), QColor("#1E1E1E"))
-        
-        # 2. 计算可见区域
+        # 计算可见区域
         visible_rows = self.height() // self.char_height
         start_row = self._scroll_position
         end_row = min(start_row + visible_rows, self.screen.rows)
         
-        # 3. 绘制虚拟屏幕内容
-        painter.setFont(self.font)
-        for row in range(start_row, end_row):
-            # 计算屏幕行在控件中的位置
-            screen_row = row  # 直接使用虚拟屏幕的行号
-            y = (screen_row - start_row) * self.char_height  # 计算在控件中的Y坐标
+        # 确定需要渲染的行
+        is_full_render = self._needs_full_render  # 保存原始值
+        if self._needs_full_render:
+            # 完整渲染：渲染所有可见行
+            rows_to_render = set(range(start_row, end_row))
+            self._needs_full_render = False
+            cols_to_render = None  # None表示渲染整行
+        else:
+            # 增量渲染：只渲染修改过的行和列
+            modified_rows = self.screen.modified_rows.copy()
+            # 只渲染可见区域内的修改行
+            rows_to_render = {row for row in modified_rows if start_row <= row < end_row}
             
-            for col in range(self.screen.cols):
+            # 如果没有修改的行，跳过渲染
+            if not rows_to_render:
+                painter.end()
+                return
+            
+            # 获取修改的列范围
+            cols_to_render = {row: self.screen.modified_cols.get(row) for row in rows_to_render}
+        
+        # 1. 绘制背景（仅完整渲染或修改行数较多时）
+        if is_full_render or len(rows_to_render) > visible_rows // 2:
+            painter.fillRect(self.rect(), QColor("#1E1E1E"))
+        
+        # 2. 绘制虚拟屏幕内容（增量渲染）
+        painter.setFont(self.font)
+        for row in sorted(rows_to_render):
+            # 计算屏幕行在控件中的位置
+            y = (row - start_row) * self.char_height
+            
+            # 如果是增量渲染，只清除需要重绘的区域
+            if cols_to_render is not None:
+                col_range = cols_to_render.get(row)
+                if col_range:
+                    # 只清除修改的列范围
+                    min_col, max_col = col_range
+                    x_start = min_col * self.char_width
+                    width = (max_col - min_col + 1) * self.char_width
+                    painter.fillRect(x_start, y, width, self.char_height, QColor("#1E1E1E"))
+                else:
+                    # 清除整行
+                    painter.fillRect(0, y, self.width(), self.char_height, QColor("#1E1E1E"))
+            
+            # 确定要渲染的列范围
+            if cols_to_render is not None:
+                col_range = cols_to_render.get(row)
+                if col_range:
+                    start_col, end_col = col_range
+                else:
+                    start_col, end_col = 0, self.screen.cols - 1
+            else:
+                start_col, end_col = 0, self.screen.cols - 1
+            
+            for col in range(start_col, end_col + 1):
                 cell = self.screen.cells[row][col]
                 x = col * self.char_width
                 
@@ -332,21 +520,27 @@ class NativeTerminalWidget(QWidget):
                     painter.drawText(x, y, self.char_width, self.char_height,
                                    Qt.AlignmentFlag.AlignCenter, cell.char)
         
-        # 4. 绘制光标(普通模式显示,NCURSES模式隐藏)
+        # 3. 绘制光标(普通模式显示,NCURSES模式隐藏)
         if not self._is_ncurses_mode and self.cursor_renderer.cursor_visible:
             cursor_row = self.screen.cursor_row - start_row
             if 0 <= cursor_row < visible_rows:
-                cell = self.screen.cells[self.screen.cursor_row][self.screen.cursor_col]
-                self.cursor_renderer.draw(
-                    painter, 
-                    cursor_row, 
-                    self.screen.cursor_col,
-                    self.char_width,
-                    self.char_height,
-                    cell.char,
-                    cell.fg_color,
-                    cell.bg_color
-                )
+                # 检查光标所在行是否需要渲染
+                if self.screen.cursor_row in rows_to_render:
+                    cell = self.screen.cells[self.screen.cursor_row][self.screen.cursor_col]
+                    self.cursor_renderer.draw(
+                        painter, 
+                        cursor_row, 
+                        self.screen.cursor_col,
+                        self.char_width,
+                        self.char_height,
+                        cell.char,
+                        cell.fg_color,
+                        cell.bg_color
+                    )
+        
+        # 记录渲染状态
+        self._last_rendered_rows = rows_to_render.copy()
+        painter.end()
     
     def keyPressEvent(self, event):
         """处理键盘输入"""
@@ -357,15 +551,25 @@ class NativeTerminalWidget(QWidget):
         modifiers = event.modifiers()
         text = event.text()
         
-        # Enter键
+        # Enter键 - 记录命令历史
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.ssh_connection.send_data('\r\n')
-            # TODO: 记录当前输入的命令到历史
+            # 记录当前输入到本地历史
+            if self.current_input_buffer.strip():
+                self.command_history.append(self.current_input_buffer.strip())
+                # 限制历史记录数量
+                if len(self.command_history) > 1000:
+                    self.command_history = self.command_history[-500:]
+                self.current_input_buffer = ""
+                self.history_index = -1
             return
         
         # Backspace键
         if key == Qt.Key.Key_Backspace:
             self.ssh_connection.send_data('\x08 \x08')
+            # 更新本地输入缓冲区
+            if self.current_input_buffer:
+                self.current_input_buffer = self.current_input_buffer[:-1]
             return
         
         # Delete键
@@ -407,6 +611,8 @@ class NativeTerminalWidget(QWidget):
             cursor = self.cursor_renderer
             # 如果没有自定义渲染逻辑,直接发送
             self.ssh_connection.send_data('\x03')
+            # 清空当前输入缓冲区
+            self.current_input_buffer = ""
             return
         
         # Ctrl+D
@@ -416,12 +622,17 @@ class NativeTerminalWidget(QWidget):
         
         # Ctrl+L - 清屏
         if key == Qt.Key.Key_L and modifiers & Qt.KeyboardModifier.ControlModifier:
+            # 发送清屏命令到服务器，服务器会返回清屏序列
             self.ssh_connection.send_data('\x0c')
+            # 同时执行本地清屏，确保状态同步
+            self.clear(mode=2)
             return
         
         # Ctrl+U - 删除整行
         if key == Qt.Key.Key_U and modifiers & Qt.KeyboardModifier.ControlModifier:
             self.ssh_connection.send_data('\x15')
+            # 清空本地输入缓冲区
+            self.current_input_buffer = ""
             return
         
         # Ctrl+K - 删除光标到行尾
@@ -463,9 +674,11 @@ class NativeTerminalWidget(QWidget):
             self.ssh_connection.send_data(function_keys[key])
             return
         
-        # 可打印字符
+        # 可打印字符 - 更新输入缓冲区
         if text and text.isprintable():
             self.ssh_connection.send_data(text)
+            # 更新本地输入缓冲区（用于历史导航）
+            self.current_input_buffer += text
             return
     
     def _history_previous(self):
@@ -479,6 +692,8 @@ class NativeTerminalWidget(QWidget):
             # 清行并显示历史命令
             self._clear_current_line()
             self._display_text_on_screen(cmd)
+            # 更新输入缓冲区
+            self.current_input_buffer = cmd
     
     def _history_next(self):
         """下一条历史命令"""
@@ -487,9 +702,29 @@ class NativeTerminalWidget(QWidget):
             cmd = self.command_history[-(self.history_index + 1)]
             self._clear_current_line()
             self._display_text_on_screen(cmd)
+            # 更新输入缓冲区
+            self.current_input_buffer = cmd
         elif self.history_index == 0:
             self.history_index = -1
             self._clear_current_line()
+            # 恢复到当前输入
+            if self.current_input_buffer:
+                self._display_text_on_screen(self.current_input_buffer)
+    
+    def get_command_history(self) -> list:
+        """
+        获取命令历史列表
+        
+        Returns:
+            命令历史列表
+        """
+        return self.command_history.copy()
+    
+    def clear_command_history(self):
+        """清空命令历史"""
+        self.command_history = []
+        self.history_index = -1
+        self.current_input_buffer = ""
     
     def _clear_current_line(self):
         """清空当前行内容"""
@@ -519,20 +754,6 @@ class NativeTerminalWidget(QWidget):
         text = clipboard.text()
         if text and self.ssh_connection:
             self.ssh_connection.send_data(text)
-    
-    def clear(self):
-        """清屏"""
-        # 清除本地虚拟屏幕
-        self.screen.clear_screen()
-        self._scroll_position = 0
-        
-        # 向服务器发送清屏命令，确保服务器也知道屏幕已清除
-        if self.ssh_connection and self.ssh_connection.is_connected:
-            # 发送ANSI清屏序列: \033[2J (清屏) + \033[H (光标归位)
-            self.ssh_connection.send_data('\033[2J\033[H')
-        
-        # 触发重绘
-        self.update()
     
     def append_data(self, data: str):
         """
@@ -589,7 +810,7 @@ class NativeTerminalWidget(QWidget):
         menu.addSeparator()
         
         clear_action = QAction("清屏", self)
-        clear_action.triggered.connect(self.clear)
+        clear_action.triggered.connect(lambda: self.clear(mode=2))
         menu.addAction(clear_action)
         
         menu.exec(event.globalPos())
