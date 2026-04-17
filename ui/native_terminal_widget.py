@@ -8,7 +8,7 @@
 import time
 import logging
 from PyQt6.QtWidgets import QWidget, QMenu
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRect
+from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction
 from core.virtual_screen import VirtualScreen
 from core.terminal_buffer import ANSIParser
