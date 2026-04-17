@@ -79,16 +79,6 @@ QTabBar::tab:first:selected {
     margin-left: 0;
 }
 
-/* 终端控件 */
-QPlainTextEdit {
-    background-color: #1e1e1e;
-    color: #d4d4d4;
-    border: none;
-    font-family: "Consolas", "Courier New", "Monaco", monospace;
-    padding: 8px;
-    selection-background-color: #264f78;
-}
-
 /* 状态栏 */
 QStatusBar {
     background-color: #2196F3;
@@ -368,16 +358,6 @@ QTabBar::tab:selected {
 
 QTabBar::tab:first:selected {
     margin-left: 0;
-}
-
-/* 终端控件 */
-QPlainTextEdit {
-    background-color: #1e1e1e;
-    color: #d4d4d4;
-    border: none;
-    font-family: "Consolas", "Courier New", "Monaco", monospace;
-    padding: 8px;
-    selection-background-color: #264f78;
 }
 
 /* 状态栏 */

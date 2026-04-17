@@ -6,6 +6,7 @@
 """
 
 import time
+import logging
 from PyQt6.QtWidgets import QWidget, QMenu
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer, QRect
 from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction
@@ -13,6 +14,8 @@ from core.virtual_screen import VirtualScreen
 from core.terminal_buffer import ANSIParser
 from core.ssh_manager import SSHConnection
 from ui.cursor_renderer import CursorRenderer
+
+logger = logging.getLogger(__name__)
 
 
 class NativeTerminalWidget(QWidget):
@@ -98,6 +101,14 @@ class NativeTerminalWidget(QWidget):
         self._min_render_interval = 16  # 最小渲染间隔（60fps）
         self._batch_update_count = 0
         self._max_batch_updates = 5  # 最大批量更新次数
+        
+        # 窗口大小调整防抖
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.timeout.connect(self._apply_resize)
+        self._pending_resize = None  # 待处理的大小调整
+        self._last_resize_time = 0
+        self._resize_debounce_interval = 100  # 防抖间隔（毫秒）
         
         # 提示: 自动更新控件大小
         self.setMinimumSize(800, 600)
@@ -773,26 +784,73 @@ class NativeTerminalWidget(QWidget):
         self._render_timer.start(16)  # 触发重绘
     
     def resizeEvent(self, event):
-        """窗口大小改变"""
+        """窗口大小改变 - 使用防抖机制避免频繁调整"""
         super().resizeEvent(event)
         
+        # 获取新的窗口大小
+        new_width = self.width()
+        new_height = self.height()
+        
         # 计算新的行列数
-        new_cols = self.width() // self.char_width
-        new_rows = self.height() // self.char_height
+        new_cols = new_width // self.char_width
+        new_rows = new_height // self.char_height
         
         # 确保至少有最小行列
         new_cols = max(40, new_cols)
         new_rows = max(10, new_rows)
         
-        # 调整虚拟屏幕大小
-        if new_cols != self.screen.cols or new_rows != self.screen.rows:
-            self.screen.resize(new_rows, new_cols)
-            
-            # 通知SSH服务器新的终端大小
-            if self.ssh_connection and self.ssh_connection.is_connected:
-                self.ssh_connection.resize_terminal(new_cols, new_rows)
+        # 如果大小没有变化，不处理
+        if (self._pending_resize and 
+            self._pending_resize['cols'] == new_cols and 
+            self._pending_resize['rows'] == new_rows):
+            return
         
-        # 重新计算可见区域并触发重绘
+        # 保存待处理的大小调整
+        self._pending_resize = {'cols': new_cols, 'rows': new_rows}
+        
+        # 启动防抖定时器
+        self._resize_timer.start(self._resize_debounce_interval)
+    
+    def _apply_resize(self):
+        """应用窗口大小调整 - 实际执行终端大小调整"""
+        if not self._pending_resize:
+            return
+        
+        new_cols = self._pending_resize['cols']
+        new_rows = self._pending_resize['rows']
+        self._pending_resize = None
+        
+        # 如果大小没有变化，不处理
+        if new_cols == self.screen.cols and new_rows == self.screen.rows:
+            return
+        
+        # 更新字体度量（确保准确性）
+        self._update_font_metrics()
+        
+        # 重新计算行列数
+        new_cols = self.width() // self.char_width
+        new_rows = self.height() // self.char_height
+        new_cols = max(40, new_cols)
+        new_rows = max(10, new_rows)
+        
+        # 调整虚拟屏幕大小
+        old_rows = self.screen.rows
+        old_cols = self.screen.cols
+        self.screen.resize(new_rows, new_cols)
+        
+        # 通知SSH服务器新的终端大小
+        if self.ssh_connection and self.ssh_connection.is_connected:
+            self.ssh_connection.resize_terminal(new_cols, new_rows)
+            logger.debug(f"终端大小已调整: {old_cols}x{old_rows} -> {new_cols}x{new_rows}")
+        
+        # 重置滚动位置（避免越界）
+        if self._scroll_position >= new_rows:
+            self._scroll_position = max(0, new_rows - 1)
+        
+        # 标记需要完整渲染
+        self._needs_full_render = True
+        
+        # 触发重绘
         self.update()
     
     def contextMenuEvent(self, event):
