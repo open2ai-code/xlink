@@ -30,7 +30,10 @@ class VirtualScreen:
     """
     虚拟屏幕缓冲区
     维护终端的二维屏幕状态,支持NCURSES全屏刷新
+    支持滚动缓冲区(scrollback buffer)保存历史输出
     """
+    
+    MAX_SCROLLBACK_ROWS = 10000  # 滚动缓冲区最大行数
     
     def __init__(self, rows: int = 24, cols: int = 80):
         """
@@ -51,6 +54,10 @@ class VirtualScreen:
         # 滚动区域(默认整个屏幕)
         self.scroll_top = 0
         self.scroll_bottom = rows - 1
+        
+        # 滚动缓冲区(scrollback buffer)
+        self.scrollback_buffer: List[List[Cell]] = []  # 保存超出屏幕的历史行
+        self.scrollback_position = 0  # 当前滚动位置(0表示在底部)
         
         # 调试计数
         self._write_count = 0
@@ -97,11 +104,8 @@ class VirtualScreen:
         
         # 边界检查: 如果光标超出屏幕,先滚动
         if self.cursor_row >= self.rows:
-            # 滚动屏幕: 移除第一行,所有行上移
-            self.cells.pop(0)
-            # 添加新的空行
-            new_row = [Cell(' ', '#D4D4D4', '#1E1E1E', False, False) for _ in range(self.cols)]
-            self.cells.append(new_row)
+            # 滚动屏幕并保存到缓冲区
+            self._scroll_up()
             # 光标回到最后一行
             self.cursor_row = self.rows - 1
         
@@ -130,11 +134,9 @@ class VirtualScreen:
         if self.cursor_col >= self.cols:
             self.cursor_col = 0
             self.cursor_row += 1
-            # 如果超出滚动区域底部,滚动屏幕
+            # 如果超出滚动区域底部,滚动屏幕并保存到缓冲区
             if self.cursor_row >= self.rows:
-                self.cells.pop(0)
-                new_row = [Cell(' ', '#D4D4D4', '#1E1E1E', False, False) for _ in range(self.cols)]
-                self.cells.append(new_row)
+                self._scroll_up()
                 self.cursor_row = self.rows - 1
         
         self._write_count += 1
@@ -176,7 +178,12 @@ class VirtualScreen:
                 2: 整个屏幕(默认)
                 3: 整个屏幕+清除滚动缓冲区
         """
-        if mode == 2:
+        if mode == 3:
+            # 清除滚动缓冲区
+            self.scrollback_buffer.clear()
+            self.scrollback_position = 0
+        
+        if mode == 2 or mode == 3:
             # 清整个屏幕
             for row in range(self.rows):
                 for col in range(self.cols):
@@ -291,7 +298,10 @@ class VirtualScreen:
     
     def _scroll_up(self):
         """向上滚动一行(在滚动区域内)"""
-        # 滚动区域顶部的一行被删除
+        # 将滚动区域顶部的一行保存到滚动缓冲区
+        top_row_cells = self.cells[self.scroll_top][:]
+        self._add_to_scrollback(top_row_cells)
+        
         # 所有行上移一行
         for row in range(self.scroll_top, self.scroll_bottom):
             self.cells[row] = self.cells[row + 1][:]
@@ -301,6 +311,82 @@ class VirtualScreen:
         for col in range(self.cols):
             self.cells[self.scroll_bottom][col].reset()
         self.modified_rows.add(self.scroll_bottom)
+    
+    def _add_to_scrollback(self, row_cells: List[Cell]):
+        """
+        添加一行到滚动缓冲区
+        
+        Args:
+            row_cells: 要保存的行单元格列表
+        """
+        # 深拷贝行数据
+        copied_row = [Cell(cell.char, cell.fg_color, cell.bg_color, cell.bold, cell.underline) 
+                     for cell in row_cells]
+        
+        self.scrollback_buffer.append(copied_row)
+        
+        # 限制缓冲区大小，避免内存溢出
+        if len(self.scrollback_buffer) > self.MAX_SCROLLBACK_ROWS:
+            # 移除最旧的行
+            self.scrollback_buffer.pop(0)
+    
+    def scroll_up(self, lines: int = 1):
+        """
+        向上滚动查看历史输出
+        
+        Args:
+            lines: 滚动行数
+        """
+        max_scroll = len(self.scrollback_buffer)
+        self.scrollback_position = min(self.scrollback_position + lines, max_scroll)
+    
+    def scroll_down(self, lines: int = 1):
+        """
+        向下滚动
+        
+        Args:
+            lines: 滚动行数
+        """
+        self.scrollback_position = max(0, self.scrollback_position - lines)
+    
+    def is_at_bottom(self) -> bool:
+        """检查是否在滚动缓冲区底部"""
+        return self.scrollback_position == 0
+    
+    def get_total_rows(self) -> int:
+        """获取总行数（缓冲区 + 屏幕）"""
+        return len(self.scrollback_buffer) + self.rows
+    
+    def get_visible_row(self, screen_row: int) -> Optional[List[Cell]]:
+        """
+        获取可见行的数据
+        
+        Args:
+            screen_row: 屏幕上的行号(0-based)
+            
+        Returns:
+            该行的单元格列表，如果越界则返回None
+        """
+        # 计算实际行索引
+        actual_row = len(self.scrollback_buffer) - self.scrollback_position + screen_row
+        
+        if actual_row < 0:
+            # 超出缓冲区顶部
+            return None
+        elif actual_row < len(self.scrollback_buffer):
+            # 在缓冲区中
+            return self.scrollback_buffer[actual_row]
+        elif actual_row < len(self.scrollback_buffer) + self.rows:
+            # 在屏幕中
+            screen_row_idx = actual_row - len(self.scrollback_buffer)
+            return self.cells[screen_row_idx]
+        else:
+            # 超出屏幕底部
+            return None
+    
+    def reset_scrollback_position(self):
+        """重置滚动位置到底部"""
+        self.scrollback_position = 0
     
     def set_scroll_region(self, top: int, bottom: int):
         """
@@ -385,5 +471,7 @@ class VirtualScreen:
             'cursor': (self.cursor_row, self.cursor_col),
             'modified_rows_count': len(self.modified_rows),
             'write_count': self._write_count,
-            'render_count': self._render_count
+            'render_count': self._render_count,
+            'scrollback_rows': len(self.scrollback_buffer),
+            'scrollback_position': self.scrollback_position
         }

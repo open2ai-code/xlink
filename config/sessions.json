@@ -6,7 +6,18 @@
       "host": "111.229.182.64",
       "port": 22,
       "username": "root",
-      "password": "Z0FBQUFBQnAzMUw1ckhON2d6Uk9xRU1OTlJwWTQ4Yk5TMHl6SGd1ZENxVHBSS2MyYk1HcW40b0gyZHdsY0JwU2JXV3BaT3BRN185ODhhTjZSM05ZM3lwQXI2Z3ZqTXVjOWc9PQ==",
+      "password": "Z0FBQUFBQnA0ZUl2czltNWFlREpURUNXTnZEcU85R3RkbzdPbDQ2NmJGajZveWJDQnJNeXdPVUZGRVRyYzhUbHFXUjlUQ3J1NFZEa0czbHBGSkxTWG1iTFRwdElJNFRnVnc9PQ==",
+      "auth_method": "password",
+      "key_path": "",
+      "remember": false
+    },
+    {
+      "id": "4955acb4-8b3a-4885-a43b-e0c5fcd9a32d",
+      "name": "10.72.12.70",
+      "host": "10.72.12.70",
+      "port": 22,
+      "username": "root",
+      "password": "Z0FBQUFBQnA0ZUl2WWIyelAwaE1Ca3VpZVBCZE4wRGx1aTJyYldnOGZfaTVudHRsdkk1ZHIxcnBGem5tVEtoMVZ1U1ByWXhzM01zWk5JaUxjTGlPZWpKRDAtQkZqZk5hcHNOQ2V3VlhPeU53Y3dZU3dmaWpHdzQ9",
       "auth_method": "password",
       "key_path": "",
       "remember": false

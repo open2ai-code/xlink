@@ -7,9 +7,9 @@
 
 import time
 import logging
-from PyQt6.QtWidgets import QWidget, QMenu
+from PyQt6.QtWidgets import QWidget, QMenu, QScrollBar
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction
+from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction, QWheelEvent
 from core.virtual_screen import VirtualScreen
 from core.terminal_buffer import ANSIParser
 from core.ssh_manager import SSHConnection
@@ -68,6 +68,12 @@ class NativeTerminalWidget(QWidget):
         # 滚动控制
         self._scroll_position = 0  # 滚动偏移(行)
         self._just_cleared_screen = False
+        
+        # 垂直滚动条
+        self.scrollbar = QScrollBar(Qt.Orientation.Vertical, self)
+        self.scrollbar.setVisible(False)  # 默认隐藏，有滚动缓冲区时显示
+        self.scrollbar.valueChanged.connect(self._on_scrollbar_value_changed)
+        self._update_scrollbar()
         
         # 命令历史管理（本地历史）
         self.command_history = []  # 本地执行的命令历史
@@ -244,6 +250,13 @@ class NativeTerminalWidget(QWidget):
             # 提示符检测
             self._check_prompt()
             
+            # 如果在底部，新数据到来时自动滚动到底部
+            if self.screen.is_at_bottom():
+                self.screen.reset_scrollback_position()
+            
+            # 更新滚动条
+            self._update_scrollbar()
+            
             # 触发批量渲染
             self._schedule_render()
         
@@ -397,6 +410,9 @@ class NativeTerminalWidget(QWidget):
         
         # 标记需要完整渲染
         self._needs_full_render = True
+        
+        # 更新滚动条
+        self._update_scrollbar()
     
     def clear(self, mode: int = 2):
         """
@@ -446,27 +462,25 @@ class NativeTerminalWidget(QWidget):
             self.update()
     
     def paintEvent(self, event):
-        """自绘核心 - 直接绘制到QWidget（增量渲染优化版）"""
+        """自绘核心 - 直接绘制到QWidget（支持滚动缓冲区）"""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         
         # 计算可见区域
         visible_rows = self.height() // self.char_height
-        start_row = self._scroll_position
-        end_row = min(start_row + visible_rows, self.screen.rows)
         
         # 确定需要渲染的行
         is_full_render = self._needs_full_render  # 保存原始值
-        if self._needs_full_render:
+        if is_full_render:
             # 完整渲染：渲染所有可见行
-            rows_to_render = set(range(start_row, end_row))
+            rows_to_render = set(range(visible_rows))
             self._needs_full_render = False
             cols_to_render = None  # None表示渲染整行
         else:
             # 增量渲染：只渲染修改过的行和列
             modified_rows = self.screen.modified_rows.copy()
             # 只渲染可见区域内的修改行
-            rows_to_render = {row for row in modified_rows if start_row <= row < end_row}
+            rows_to_render = {row for row in modified_rows if row < visible_rows}
             
             # 如果没有修改的行，跳过渲染
             if not rows_to_render:
@@ -480,15 +494,21 @@ class NativeTerminalWidget(QWidget):
         if is_full_render or len(rows_to_render) > visible_rows // 2:
             painter.fillRect(self.rect(), QColor("#1E1E1E"))
         
-        # 2. 绘制虚拟屏幕内容（增量渲染）
+        # 2. 绘制虚拟屏幕内容（支持滚动缓冲区）
         painter.setFont(self.font)
-        for row in sorted(rows_to_render):
+        for screen_row in sorted(rows_to_render):
             # 计算屏幕行在控件中的位置
-            y = (row - start_row) * self.char_height
+            y = screen_row * self.char_height
+            
+            # 从滚动缓冲区或屏幕获取行数据
+            row_cells = self.screen.get_visible_row(screen_row)
+            if row_cells is None:
+                # 如果该行不存在，跳过
+                continue
             
             # 如果是增量渲染，只清除需要重绘的区域
             if cols_to_render is not None:
-                col_range = cols_to_render.get(row)
+                col_range = cols_to_render.get(screen_row)
                 if col_range:
                     # 只清除修改的列范围
                     min_col, max_col = col_range
@@ -501,7 +521,7 @@ class NativeTerminalWidget(QWidget):
             
             # 确定要渲染的列范围
             if cols_to_render is not None:
-                col_range = cols_to_render.get(row)
+                col_range = cols_to_render.get(screen_row)
                 if col_range:
                     start_col, end_col = col_range
                 else:
@@ -509,8 +529,8 @@ class NativeTerminalWidget(QWidget):
             else:
                 start_col, end_col = 0, self.screen.cols - 1
             
-            for col in range(start_col, end_col + 1):
-                cell = self.screen.cells[row][col]
+            for col in range(start_col, min(end_col + 1, len(row_cells))):
+                cell = row_cells[col]
                 x = col * self.char_width
                 
                 # 绘制背景色
@@ -531,23 +551,25 @@ class NativeTerminalWidget(QWidget):
                     painter.drawText(x, y, self.char_width, self.char_height,
                                    Qt.AlignmentFlag.AlignCenter, cell.char)
         
-        # 3. 绘制光标(普通模式显示,NCURSES模式隐藏)
-        if not self._is_ncurses_mode and self.cursor_renderer.cursor_visible:
-            cursor_row = self.screen.cursor_row - start_row
+        # 3. 绘制光标(普通模式显示,NCURSES模式隐藏,且只在底部时显示)
+        if not self._is_ncurses_mode and self.cursor_renderer.cursor_visible and self.screen.is_at_bottom():
+            cursor_row = self.screen.cursor_row
             if 0 <= cursor_row < visible_rows:
                 # 检查光标所在行是否需要渲染
-                if self.screen.cursor_row in rows_to_render:
-                    cell = self.screen.cells[self.screen.cursor_row][self.screen.cursor_col]
-                    self.cursor_renderer.draw(
-                        painter, 
-                        cursor_row, 
-                        self.screen.cursor_col,
-                        self.char_width,
-                        self.char_height,
-                        cell.char,
-                        cell.fg_color,
-                        cell.bg_color
-                    )
+                if cursor_row in rows_to_render:
+                    row_cells = self.screen.get_visible_row(cursor_row)
+                    if row_cells and self.screen.cursor_col < len(row_cells):
+                        cell = row_cells[self.screen.cursor_col]
+                        self.cursor_renderer.draw(
+                            painter, 
+                            cursor_row, 
+                            self.screen.cursor_col,
+                            self.char_width,
+                            self.char_height,
+                            cell.char,
+                            cell.fg_color,
+                            cell.bg_color
+                        )
         
         # 记录渲染状态
         self._last_rendered_rows = rows_to_render.copy()
@@ -564,7 +586,7 @@ class NativeTerminalWidget(QWidget):
         
         # Enter键 - 记录命令历史
         if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self.ssh_connection.send_data('\r\n')
+            self.ssh_connection.send_data('\r')
             # 记录当前输入到本地历史
             if self.current_input_buffer.strip():
                 self.command_history.append(self.current_input_buffer.strip())
@@ -852,6 +874,95 @@ class NativeTerminalWidget(QWidget):
         
         # 触发重绘
         self.update()
+    
+    def _update_scrollbar(self):
+        """更新滚动条状态"""
+        total_rows = self.screen.get_total_rows()
+        visible_rows = self.height() // self.char_height
+        
+        # 只有当总行数超过可见行数时才显示滚动条
+        if total_rows > visible_rows:
+            self.scrollbar.setVisible(True)
+            
+            # 设置滚动条范围
+            self.scrollbar.setMinimum(0)
+            self.scrollbar.setMaximum(total_rows - visible_rows)
+            
+            # 设置页面大小（可见行数）
+            self.scrollbar.setPageStep(visible_rows)
+            
+            # 设置单步滚动距离（3行）
+            self.scrollbar.setSingleStep(3)
+            
+            # 设置当前值
+            self.scrollbar.setValue(self.screen.scrollback_position)
+            
+            # 调整滚动条位置和大小
+            scrollbar_width = 12
+            self.scrollbar.setGeometry(
+                self.width() - scrollbar_width,
+                0,
+                scrollbar_width,
+                self.height()
+            )
+        else:
+            self.scrollbar.setVisible(False)
+    
+    def _on_scrollbar_value_changed(self, value: int):
+        """滚动条值变化处理"""
+        self.screen.scrollback_position = value
+        self._needs_full_render = True
+        self.update()
+    
+    def wheelEvent(self, event: QWheelEvent):
+        """鼠标滚轮事件"""
+        # 计算滚动行数
+        delta = event.angleDelta().y()
+        lines = abs(delta) // 120 * 3  # 每120度滚动3行
+        
+        if delta > 0:
+            # 向上滚动
+            self.screen.scroll_up(lines)
+        else:
+            # 向下滚动
+            self.screen.scroll_down(lines)
+        
+        # 更新滚动条
+        self._update_scrollbar()
+        
+        # 触发重绘
+        self._needs_full_render = True
+        self.update()
+        
+        event.accept()
+    
+    def resizeEvent(self, event):
+        """窗口大小改变 - 使用防抖机制避免频繁调整"""
+        super().resizeEvent(event)
+        
+        # 获取新的窗口大小
+        new_width = self.width()
+        new_height = self.height()
+        
+        # 计算新的行列数
+        new_cols = new_width // self.char_width
+        new_rows = new_height // self.char_height
+        
+        # 确保至少有最小行列
+        new_cols = max(40, new_cols)
+        new_rows = max(10, new_rows)
+        
+        # 如果大小没有变化，不处理
+        if (self._pending_resize and 
+            self._pending_resize['cols'] == new_cols and 
+            self._pending_resize['rows'] == new_rows):
+            return
+        
+        # 保存待处理的大小调整
+        self._pending_resize = {'cols': new_cols, 'rows': new_rows}
+        
+        # 启动防抖定时器
+        self._resize_timer.start(self._resize_debounce_interval)
     
     def contextMenuEvent(self, event):
         """右键菜单"""
