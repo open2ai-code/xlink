@@ -57,9 +57,9 @@ class Logger:
             datefmt='%Y-%m-%d %H:%M:%S'
         )
         
-        # 1. 控制台输出 (INFO及以上)
+        # 1. 控制台输出 (DEBUG及以上)
         console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setLevel(logging.INFO)
+        console_handler.setLevel(logging.DEBUG)
         console_handler.setFormatter(log_format)
         cls._logger.addHandler(console_handler)
         

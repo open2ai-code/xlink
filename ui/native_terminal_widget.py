@@ -6,7 +6,7 @@
 """
 
 import time
-import logging
+from core.logger import get_logger
 from PyQt6.QtWidgets import QWidget, QMenu, QScrollBar
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction, QWheelEvent
@@ -15,7 +15,7 @@ from core.terminal_buffer import ANSIParser
 from core.ssh_manager import SSHConnection
 from ui.cursor_renderer import CursorRenderer
 
-logger = logging.getLogger(__name__)
+logger = get_logger("NativeTerminal")
 
 
 class NativeTerminalWidget(QWidget):
@@ -188,6 +188,7 @@ class NativeTerminalWidget(QWidget):
     
     def _on_ssh_data(self, data: str):
         """接收SSH数据"""
+        logger.debug(f"[SSH数据] 接收到 {len(data)} 字节数据")
         self.receive_buffer += data
         
         # 解析ANSI序列
@@ -195,13 +196,17 @@ class NativeTerminalWidget(QWidget):
         
         if not segments and not self.ansi_parser.commands:
             # 没有完整的数据,等待更多
+            logger.debug("[SSH数据] 数据不完整，等待更多")
             return
+        
+        logger.debug(f"[SSH数据] 解析完成: {len(segments)} 个文本段, {len(self.ansi_parser.commands)} 个控制命令")
         
         # 清空缓冲区
         self.receive_buffer = ""
         
         # 先处理控制命令(如清屏),再写入文本
         for cmd in self.ansi_parser.commands:
+            logger.debug(f"[SSH数据] 处理控制命令: {cmd.command_type}, 参数: {cmd.params}")
             if cmd.command_type == 'clear_screen':
                 # 获取清屏模式
                 mode = cmd.params.get('mode', 2)
@@ -231,8 +236,14 @@ class NativeTerminalWidget(QWidget):
         # 写入文本数据
         for segment in segments:
             if segment.text:
+                logger.debug(f"[SSH数据] 写入文本段: {len(segment.text)} 字符, 前50字符: {repr(segment.text[:50])}")
                 # 检测并记录提示符
                 self._detect_and_record_prompt(segment.text)
+                
+                # 记录写入前的屏幕状态
+                old_cursor_row = self.screen.cursor_row
+                old_cursor_col = self.screen.cursor_col
+                old_scrollback_len = len(self.screen.scrollback_buffer)
                 
                 # 正常写入文本
                 self.screen.write_text(segment.text, {
@@ -241,9 +252,21 @@ class NativeTerminalWidget(QWidget):
                     'bold': segment.bold,
                     'underline': segment.underline
                 })
+                
+                # 记录写入后的屏幕状态
+                new_cursor_row = self.screen.cursor_row
+                new_cursor_col = self.screen.cursor_col
+                new_scrollback_len = len(self.screen.scrollback_buffer)
+                
+                if old_scrollback_len != new_scrollback_len:
+                    logger.debug(f"[SSH数据] 滚动缓冲区变化: {old_scrollback_len} -> {new_scrollback_len} 行")
+                if old_cursor_row != new_cursor_row or old_cursor_col != new_cursor_col:
+                    logger.debug(f"[SSH数据] 光标位置变化: ({old_cursor_row},{old_cursor_col}) -> ({new_cursor_row},{new_cursor_col})")
         
         # NCURSES模式检测
         if len(self.screen.modified_rows) > 0:
+            logger.debug(f"[SSH数据] 修改的行数: {len(self.screen.modified_rows)}, 光标行: {self.screen.cursor_row}")
+            
             self._detect_ncurses_mode(len(self.screen.modified_rows), 
                                      self.screen.cursor_row)
             
@@ -252,13 +275,24 @@ class NativeTerminalWidget(QWidget):
             
             # 如果在底部，新数据到来时自动滚动到底部
             if self.screen.is_at_bottom():
+                logger.debug("[SSH数据] 在底部，重置滚动位置")
                 self.screen.reset_scrollback_position()
+            else:
+                logger.debug(f"[SSH数据] 不在底部，scrollback_position={self.screen.scrollback_position}")
+            
+            # 检查是否发生了滚动（滚动缓冲区有变化）
+            if len(self.screen.scrollback_buffer) > 0:
+                logger.debug("[SSH数据] 检测到滚动缓冲区有内容，触发完整渲染")
+                self._needs_full_render = True
             
             # 更新滚动条
             self._update_scrollbar()
             
             # 触发批量渲染
+            logger.debug("[SSH数据] 触发渲染")
             self._schedule_render()
+        else:
+            logger.debug("[SSH数据] 没有修改的行，跳过渲染")
         
         # 重置ANSI解析器状态
         self.ansi_parser.reset_state()
@@ -479,7 +513,7 @@ class NativeTerminalWidget(QWidget):
         else:
             # 增量渲染：只渲染修改过的行和列
             modified_rows = self.screen.modified_rows.copy()
-            # 只渲染可见区域内的修改行
+            # 渲染可见区域内的修改行
             rows_to_render = {row for row in modified_rows if row < visible_rows}
             
             # 如果没有修改的行，跳过渲染
