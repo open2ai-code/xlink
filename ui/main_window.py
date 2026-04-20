@@ -353,8 +353,8 @@ class MainWindow(QMainWindow):
         # 查找当前标签页中的SFTP面板
         container = current_terminal.parent()
         if container:
-            from ui.sftp_panel import SftpPanel
-            sftp_panels = container.findChildren(SftpPanel)
+            from ui.sftp_window import SftpFileManager
+            sftp_panels = container.findChildren(SftpFileManager)
             if sftp_panels:
                 sftp_panel = sftp_panels[0]
                 is_visible = sftp_panel.isVisible()

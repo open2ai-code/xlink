@@ -118,6 +118,12 @@ class NativeTerminalWidget(QWidget):
         
         # 提示: 自动更新控件大小
         self.setMinimumSize(800, 600)
+        
+        # 文本选择状态
+        self._is_selecting = False  # 是否正在选择
+        self._selection_start = None  # 选择起点 (row, col)
+        self._selection_end = None  # 选择终点 (row, col)
+        self._has_selection = False  # 是否有选中的文本
     
     def _update_font_metrics(self):
         """更新字体度量"""
@@ -585,7 +591,23 @@ class NativeTerminalWidget(QWidget):
                     painter.drawText(x, y, self.char_width, self.char_height,
                                    Qt.AlignmentFlag.AlignCenter, cell.char)
         
-        # 3. 绘制光标(普通模式显示,NCURSES模式隐藏,且只在底部时显示)
+        # 3. 绘制选中区域高亮
+        if self._has_selection:
+            for screen_row in sorted(rows_to_render):
+                if not self._has_selection:
+                    break
+                    
+                y = screen_row * self.char_height
+                
+                # 检查该行是否有选中的单元格
+                for col in range(self.screen.cols):
+                    if self._is_cell_selected(screen_row, col):
+                        x = col * self.char_width
+                        # 绘制选中背景（半透明白色）
+                        painter.fillRect(x, y, self.char_width, self.char_height, 
+                                       QColor(255, 255, 255, 80))
+        
+        # 4. 绘制光标(普通模式显示,NCURSES模式隐藏,且只在底部时显示)
         if not self._is_ncurses_mode and self.cursor_renderer.cursor_visible and self.screen.is_at_bottom():
             cursor_row = self.screen.cursor_row
             if 0 <= cursor_row < visible_rows:
@@ -675,7 +697,11 @@ class NativeTerminalWidget(QWidget):
         
         # Ctrl+C
         if key == Qt.Key.Key_C and modifiers & Qt.KeyboardModifier.ControlModifier:
-            cursor = self.cursor_renderer
+            # 如果有选中的文本，先复制
+            if self._has_selection:
+                self.copy()
+                return
+            
             # 如果没有自定义渲染逻辑,直接发送
             self.ssh_connection.send_data('\x03')
             # 清空当前输入缓冲区
@@ -970,6 +996,187 @@ class NativeTerminalWidget(QWidget):
         
         event.accept()
     
+    def mousePressEvent(self, event):
+        """鼠标按下事件 - 开始文本选择"""
+        from PyQt6.QtCore import Qt
+        
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 计算点击位置的行列坐标
+            row = event.pos().y() // self.char_height
+            col = event.pos().x() // self.char_width
+            
+            # 边界检查
+            row = max(0, min(row, self.screen.rows - 1))
+            col = max(0, min(col, self.screen.cols - 1))
+            
+            # 开始选择
+            self._is_selecting = True
+            self._selection_start = (row, col)
+            self._selection_end = (row, col)
+            self._has_selection = False
+            
+            # 清除NCURSES模式，允许光标显示
+            if self._is_ncurses_mode:
+                self._is_ncurses_mode = False
+                self.cursor_visible = True
+            
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+    
+    def mouseDoubleClickEvent(self, event):
+        """鼠标双击事件 - 选择单词"""
+        from PyQt6.QtCore import Qt
+        
+        if event.button() == Qt.MouseButton.LeftButton:
+            # 计算点击位置的行列坐标
+            row = event.pos().y() // self.char_height
+            col = event.pos().x() // self.char_width
+            
+            # 边界检查
+            row = max(0, min(row, self.screen.rows - 1))
+            col = max(0, min(col, self.screen.cols - 1))
+            
+            # 获取该行的文本
+            row_cells = self.screen.get_visible_row(row)
+            if row_cells and col < len(row_cells):
+                # 找到单词的起始和结束位置
+                start_col = col
+                end_col = col
+                
+                # 向左查找单词边界
+                while start_col > 0 and row_cells[start_col - 1].char not in (' ', '\t', '\n'):
+                    start_col -= 1
+                
+                # 向右查找单词边界
+                while end_col < len(row_cells) - 1 and row_cells[end_col + 1].char not in (' ', '\t', '\n'):
+                    end_col += 1
+                
+                # 设置选择范围
+                self._selection_start = (row, start_col)
+                self._selection_end = (row, end_col)
+                self._has_selection = True
+                self._is_selecting = False
+                
+                # 触发重绘
+                self._needs_full_render = True
+                self.update()
+            
+            event.accept()
+        else:
+            super().mouseDoubleClickEvent(event)
+    
+    def mouseMoveEvent(self, event):
+        """鼠标移动事件 - 扩展文本选择"""
+        from PyQt6.QtCore import Qt
+        
+        if self._is_selecting and (event.buttons() & Qt.MouseButton.LeftButton):
+            # 计算移动位置的行列坐标
+            row = event.pos().y() // self.char_height
+            col = event.pos().x() // self.char_width
+            
+            # 边界检查
+            row = max(0, min(row, self.screen.rows - 1))
+            col = max(0, min(col, self.screen.cols - 1))
+            
+            # 更新选择终点
+            self._selection_end = (row, col)
+            self._has_selection = True
+            
+            # 触发重绘
+            self._needs_full_render = True
+            self.update()
+            
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+    
+    def mouseReleaseEvent(self, event):
+        """鼠标释放事件 - 完成文本选择"""
+        from PyQt6.QtCore import Qt
+        
+        if event.button() == Qt.MouseButton.LeftButton and self._is_selecting:
+            # 结束选择
+            self._is_selecting = False
+            
+            # 如果选择区域太小，清除选择
+            if self._selection_start == self._selection_end:
+                self._has_selection = False
+                self._selection_start = None
+                self._selection_end = None
+            
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+    
+    def _get_selected_text(self) -> str:
+        """获取选中的文本"""
+        if not self._has_selection or not self._selection_start or not self._selection_end:
+            return ""
+        
+        start_row, start_col = self._selection_start
+        end_row, end_col = self._selection_end
+        
+        # 确保起点在终点之前
+        if (start_row, start_col) > (end_row, end_col):
+            start_row, start_col, end_row, end_col = end_row, end_col, start_row, start_col
+        
+        selected_lines = []
+        
+        for row in range(start_row, end_row + 1):
+            row_cells = self.screen.get_visible_row(row)
+            if row_cells is None:
+                continue
+            
+            if row == start_row and row == end_row:
+                # 单行选择
+                line_text = ''.join(cell.char for cell in row_cells[start_col:end_col+1])
+            elif row == start_row:
+                # 起始行
+                line_text = ''.join(cell.char for cell in row_cells[start_col:])
+            elif row == end_row:
+                # 结束行
+                line_text = ''.join(cell.char for cell in row_cells[:end_col+1])
+            else:
+                # 中间行
+                line_text = ''.join(cell.char for cell in row_cells)
+            
+            selected_lines.append(line_text)
+        
+        return '\n'.join(selected_lines)
+    
+    def _clear_selection(self):
+        """清除选择状态"""
+        self._is_selecting = False
+        self._has_selection = False
+        self._selection_start = None
+        self._selection_end = None
+    
+    def _is_cell_selected(self, row: int, col: int) -> bool:
+        """检查指定单元格是否在选择范围内"""
+        if not self._has_selection or not self._selection_start or not self._selection_end:
+            return False
+        
+        start_row, start_col = self._selection_start
+        end_row, end_col = self._selection_end
+        
+        # 确保起点在终点之前
+        if (start_row, start_col) > (end_row, end_col):
+            start_row, start_col, end_row, end_col = end_row, end_col, start_row, start_col
+        
+        # 检查是否在选择范围内
+        if row < start_row or row > end_row:
+            return False
+        
+        if row == start_row and row == end_row:
+            return start_col <= col <= end_col
+        elif row == start_row:
+            return col >= start_col
+        elif row == end_row:
+            return col <= end_col
+        else:
+            return True
+    
     def resizeEvent(self, event):
         """窗口大小改变 - 使用防抖机制避免频繁调整"""
         super().resizeEvent(event)
@@ -1019,7 +1226,15 @@ class NativeTerminalWidget(QWidget):
         menu.exec(event.globalPos())
     
     def copy(self):
-        """复制选中的文本(暂未实现选择功能)"""
+        """复制选中的文本到剪贴板"""
         from PyQt6.QtWidgets import QApplication
-        # TODO: 实现文本选择功能
-        pass
+        
+        if self._has_selection:
+            selected_text = self._get_selected_text()
+            if selected_text:
+                clipboard = QApplication.clipboard()
+                clipboard.setText(selected_text)
+                # 复制后清除选择
+                self._clear_selection()
+                self._needs_full_render = True
+                self.update()
