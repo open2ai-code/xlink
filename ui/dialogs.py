@@ -4,12 +4,12 @@
 包含会话创建/编辑对话框等
 """
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QComboBox, QSpinBox, QCheckBox, QMessageBox,
     QFormLayout, QDialogButtonBox
 )
-from PyQt6.QtCore import Qt
+from PySide6.QtCore import Qt
 import uuid
 
 
@@ -107,7 +107,7 @@ class SessionDialog(QDialog):
     
     def browse_key_file(self):
         """浏览密钥文件"""
-        from PyQt6.QtWidgets import QFileDialog
+        from PySide6.QtWidgets import QFileDialog
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "选择私钥文件",

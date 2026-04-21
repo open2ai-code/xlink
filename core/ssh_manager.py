@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-SSH连接管理模块 - 商用级重构版
-基于paramiko实现高性能、高稳定性的SSH连接管理
+SSH连接管理模块 - AsyncSSH版本
+基于asyncssh实现高性能、异步的SSH连接管理
 
 核心特性:
-- 线程安全的连接管理
+- 异步非阻塞连接
 - 智能心跳保活机制
 - 自动重连与异常恢复
 - 低延迟数据传输
@@ -12,28 +12,60 @@ SSH连接管理模块 - 商用级重构版
 - 终端模式优化(vt100/xterm)
 """
 
-import paramiko
+import asyncio
 import threading
 import time
-import queue
-from typing import Optional, Dict, Any, Callable
-from PyQt6.QtCore import QObject, pyqtSignal, QTimer
+from typing import Optional, Dict, Any
+import asyncssh
+from PySide6.QtCore import QObject, Signal as pyqtSignal, QTimer
 from core.logger import get_logger
 
 
 logger = get_logger("SSHConnection")
 
 
+class MySSHSession(asyncssh.SSHClientSession):
+    """
+    自定义SSH会话类，用于处理数据接收和连接状态
+    """
+    def __init__(self, data_received_callback=None, connection_lost_callback=None):
+        self._data_received_callback = data_received_callback
+        self._connection_lost_callback = connection_lost_callback
+        self._chan = None
+    
+    def connection_made(self, chan):
+        """连接建立时调用"""
+        self._chan = chan
+        logger.debug("SSH会话连接已建立")
+    
+    def data_received(self, data: str, datatype: asyncssh.DataType = None):
+        """接收到数据时调用 - AsyncSSH已经解码为字符串"""
+        try:
+            logger.debug(f"[SSH Session] 接收到数据: {len(data)} 字符, 前100字符: {repr(data[:100])}")
+            if self._data_received_callback:
+                self._data_received_callback(data)
+        except Exception as e:
+            logger.error(f"数据处理失败: {e}")
+    
+    def connection_lost(self, exc):
+        """连接丢失时调用"""
+        logger.debug(f"SSH会话连接丢失: {exc}")
+        if self._connection_lost_callback:
+            self._connection_lost_callback(exc)
+    
+    def get_channel(self):
+        """获取channel对象"""
+        return self._chan
+
+
 class SSHConnection(QObject):
     """
-    商用级SSH连接管理类
+    基于AsyncSSH的SSH连接管理类
     
     特性:
-    - 线程安全的异步连接
+    - 异步非阻塞连接
     - 智能心跳检测(可配置间隔)
     - 自动重连机制(指数退避)
-    - 双缓冲队列(输入/输出)
-    - 低延迟数据读取(自适应轮询)
     - 完善的异常处理
     """
     
@@ -53,32 +85,27 @@ class SSHConnection(QObject):
     def __init__(self):
         super().__init__()
         
-        # SSH核心对象
-        self.client: Optional[paramiko.SSHClient] = None
-        self.channel: Optional[paramiko.Channel] = None
-        self.transport: Optional[paramiko.Transport] = None
+        # AsyncSSH核心对象
+        self.conn: Optional[asyncssh.SSHClientConnection] = None
+        self.process: Optional[asyncssh.SSHClientProcess] = None
+        
+        # 异步事件循环和线程
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready_event = threading.Event()
         
         # 连接状态
         self._state = self.STATE_DISCONNECTED
-        self._state_lock = threading.Lock()
+        self._running = False
         
         # 会话信息
         self.session_info: Dict[str, Any] = {}
         self._connect_params: Dict[str, Any] = {}
         
-        # 线程管理
-        self._read_thread: Optional[threading.Thread] = None
-        self._heartbeat_thread: Optional[threading.Thread] = None
-        self._running = False
-        
-        # 数据队列(线程安全)
-        self._send_queue = queue.Queue()
-        
         # 心跳配置
         self.heartbeat_interval = 30  # 秒
-        self.heartbeat_timeout = 90  # 秒
-        self._last_heartbeat_time = 0
         self._last_activity_time = 0
+        self._heartbeat_task: Optional[asyncio.Task] = None
         
         # 重连配置
         self.auto_reconnect = True
@@ -92,32 +119,52 @@ class SSHConnection(QObject):
         self.term_height = 40
         self.term_type = 'xterm-256color'
         
-        # 数据读取优化
-        self._read_buffer_size = 8192  # 8KB读取缓冲区
-        self._read_poll_interval = 0.005  # 5ms轮询间隔(低延迟)
-        self._max_idle_poll_interval = 0.1  # 100ms最大空闲轮询间隔
+        # 数据读取缓冲
+        self._read_task: Optional[asyncio.Task] = None
         
-        # 日志
         logger.debug("SSHConnection实例已创建")
+    
+    def _start_asyncio_loop(self):
+        """启动异步事件循环线程"""
+        def run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._ready_event.set()
+            self._loop.run_forever()
+        
+        self._thread = threading.Thread(target=run_loop, daemon=True, name="SSH-AsyncIO")
+        self._thread.start()
+        self._ready_event.wait()  # 等待事件循环就绪
+    
+    def _stop_asyncio_loop(self):
+        """停止异步事件循环"""
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+    
+    def _run_coroutine(self, coro):
+        """在异步线程中运行协程"""
+        if not self._loop:
+            raise RuntimeError("异步事件循环未启动")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30)
     
     @property
     def is_connected(self) -> bool:
-        """线程安全地检查连接状态"""
-        with self._state_lock:
-            return self._state == self.STATE_CONNECTED
+        """检查连接状态"""
+        return self._state == self.STATE_CONNECTED
     
     @property
     def state(self) -> str:
         """获取当前连接状态"""
-        with self._state_lock:
-            return self._state
+        return self._state
     
     def _set_state(self, new_state: str):
-        """线程安全地设置连接状态"""
-        with self._state_lock:
-            old_state = self._state
-            self._state = new_state
-            logger.debug(f"连接状态变更: {old_state} -> {new_state}")
+        """设置连接状态"""
+        old_state = self._state
+        self._state = new_state
+        logger.debug(f"连接状态变更: {old_state} -> {new_state}")
     
     def connect(self, host: str, port: int, username: str, 
                 password: Optional[str] = None, 
@@ -136,6 +183,10 @@ class SSHConnection(QObject):
             timeout: 连接超时时间(秒)
             auto_reconnect: 是否启用自动重连
         """
+        # 启动异步事件循环
+        if not self._loop:
+            self._start_asyncio_loop()
+        
         # 保存连接参数(用于重连)
         self._connect_params = {
             'host': host,
@@ -154,43 +205,31 @@ class SSHConnection(QObject):
         
         self.auto_reconnect = auto_reconnect
         
-        # 在新线程中执行连接
-        connect_thread = threading.Thread(
-            target=self._do_connect,
-            args=(host, port, username, password, key_file, timeout),
-            daemon=True,
-            name=f"SSH-Connect-{host}:{port}"
-        )
-        connect_thread.start()
+        # 在异步线程中执行连接
+        self._run_coroutine(self._do_connect(host, port, username, password, key_file, timeout))
     
-    def _do_connect(self, host: str, port: int, username: str,
-                    password: Optional[str], key_file: Optional[str],
-                    timeout: int):
-        """实际执行连接(在线程中运行)"""
+    async def _do_connect(self, host: str, port: int, username: str,
+                          password: Optional[str], key_file: Optional[str],
+                          timeout: int):
+        """实际执行连接(异步)"""
         try:
             self._set_state(self.STATE_CONNECTING)
             logger.info(f"正在连接SSH服务器: {host}:{port}")
             
-            # 创建SSH客户端
-            self.client = paramiko.SSHClient()
-            self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            
-            # 连接参数优化
+            # 连接参数
             connect_kwargs = {
-                'hostname': host,
+                'host': host,
                 'port': port,
                 'username': username,
-                'timeout': timeout,
-                'allow_agent': False,  # 禁用SSH agent,避免干扰
-                'look_for_keys': False,  # 不自动查找密钥
-                'compress': False,  # 禁用压缩,降低延迟
+                'known_hosts': None,  # 跳过主机密钥验证
+                'connect_timeout': timeout,
             }
             
             # 认证方式
             if key_file and key_file.strip():
                 # 私钥认证
-                pkey = self._load_private_key(key_file)
-                connect_kwargs['pkey'] = pkey
+                client_keys = [key_file]
+                connect_kwargs['client_keys'] = client_keys
                 logger.debug("使用私钥认证")
             elif password:
                 # 密码认证
@@ -198,40 +237,24 @@ class SSHConnection(QObject):
                 logger.debug("使用密码认证")
             
             # 建立连接
-            self.client.connect(**connect_kwargs)
-            self.transport = self.client.get_transport()
+            self.conn = await asyncssh.connect(**connect_kwargs)
             
-            if not self.transport:
-                raise paramiko.SSHException("无法获取transport")
-            
-            # 保持连接活跃
-            self.transport.set_keepalive(self.heartbeat_interval)
-            
-            # 创建交互式channel(终端模式优化)
-            self.channel = self.client.invoke_shell(
-                term=self.term_type,
-                width=self.term_width,
-                height=self.term_height
+            # 打开交互式shell
+            self.chan, self.process = await self.conn.create_session(
+                lambda: MySSHSession(
+                    data_received_callback=self._on_data_received,
+                    connection_lost_callback=self._on_connection_lost
+                ),
+                command=None,  # None表示打开交互式shell
+                term_type=self.term_type,
+                term_size=(self.term_width, self.term_height),
+                encoding='utf-8'
             )
-            
-            # 设置为非阻塞模式
-            self.channel.setblocking(0)
-            
-            # 设置channel超时
-            self.channel.settimeout(1.0)
-            
-            # 注意: 不禁用服务器回显
-            # 我们通过在终端控件中设置 ReadOnly=True 来阻止本地显示
-            # 所有显示都来自服务器的回显
             
             # 更新状态
             self._set_state(self.STATE_CONNECTED)
             self._reconnect_attempts = 0
             self._running = True
-            
-            # 注意: 不在这里发送初始化命令，因为shell可能还没准备好
-            # 改为在_data_read_loop中检测提示符后再发送
-            # 这样可以确保命令在shell完全启动后执行
             
             self._last_activity_time = time.time()
             
@@ -240,19 +263,19 @@ class SSHConnection(QObject):
             # 发送连接成功信号
             self.connection_status.emit(self.STATE_CONNECTED)
             
-            # 启动后台线程
-            self._start_read_thread()
-            self._start_heartbeat_thread()
+            # 启动后台任务
+            self._start_read_task()
+            self._start_heartbeat_task()
             
-        except paramiko.AuthenticationException:
+        except asyncssh.PermissionDenied as e:
             error_msg = "认证失败: 用户名、密码或私钥错误"
             logger.error(error_msg)
             self._set_state(self.STATE_DISCONNECTED)
             self.error_occurred.emit(error_msg)
             self.connection_status.emit("error")
             
-        except paramiko.SSHException as e:
-            error_msg = f"SSH协议错误: {str(e)}"
+        except asyncssh.DisconnectError as e:
+            error_msg = f"SSH连接断开: {str(e)}"
             logger.error(error_msg)
             self._set_state(self.STATE_DISCONNECTED)
             self.error_occurred.emit(error_msg)
@@ -265,158 +288,95 @@ class SSHConnection(QObject):
             self.error_occurred.emit(error_msg)
             self.connection_status.emit("error")
     
-    def _load_private_key(self, key_file: str):
+    def _start_read_task(self):
+        """启动数据读取任务 - 实际上不需要，因为数据会通过SSHSession回调传递"""
+        logger.debug("使用SSHSession机制，无需额外的数据读取任务")
+
+    def _on_data_received(self, data: str):
         """
-        加载私钥文件(支持多种格式)
+        数据接收回调
         
         Args:
-            key_file: 私钥文件路径
+            data: 接收到的数据字符串
+        """
+        logger.info(f"[SSH回调] 接收到 {len(data)} 字节数据, 前100字符: {repr(data[:100])}")
+        
+        # 更新活动时间
+        self._last_activity_time = time.time()
+        
+        # 发送数据信号
+        self.data_received.emit(data)
+    
+    def _on_connection_lost(self, exc=None):
+        """
+        连接丢失回调
+        
+        Args:
+            exc: 异常对象（可选）
+        """
+        logger.info(f"SSH连接丢失: {exc}")
+        self._set_state(self.STATE_DISCONNECTED)
+        
+        # 检查是否应该重连
+        if (self.auto_reconnect and 
+            self._reconnect_attempts < self.max_reconnect_attempts and
+            self._running):
             
-        Returns:
-            PKey对象
-        """
-        key_classes = [
-            paramiko.RSAKey,
-            paramiko.DSSKey,
-            paramiko.ECDSAKey,
-            paramiko.Ed25519Key
-        ]
-        
-        last_exception = None
-        for key_class in key_classes:
-            try:
-                return key_class.from_private_key_file(key_file)
-            except paramiko.PasswordRequiredException:
-                raise paramiko.SSHException("私钥已加密,需要提供密码")
-            except paramiko.SSHException as e:
-                last_exception = e
-                continue
-        
-        raise paramiko.SSHException(f"无法识别的私钥格式: {last_exception}")
+            self._reconnect_attempts += 1
+            self._set_state(self.STATE_RECONNECTING)
+            self.reconnecting.emit(self._reconnect_attempts)
+            
+            # 计算重连延迟（指数退避）
+            delay = min(self.reconnect_delay * (2 ** (self._reconnect_attempts - 1)), 
+                       self.max_reconnect_delay)
+            
+            logger.info(f"准备进行第 {self._reconnect_attempts} 次重连，延迟 {delay} 秒")
+            
+            # 延迟后重连
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda: self._attempt_reconnect())
+            timer.start(int(delay * 1000))
+        else:
+            # 重连失败或禁用重连
+            self.connection_status.emit(self.STATE_DISCONNECTED)
+            self._running = False
     
-    def _start_read_thread(self):
-        """启动数据读取线程"""
-        self._read_thread = threading.Thread(
-            target=self._read_output_loop,
-            daemon=True,
-            name=f"SSH-Read-{self.session_info.get('host', 'unknown')}"
+    def _attempt_reconnect(self):
+        """尝试重连"""
+        if not self._running:
+            return
+            
+        params = self._connect_params
+        logger.info(f"正在进行第 {self._reconnect_attempts} 次重连: {params['host']}:{params['port']}")
+        
+        # 重新连接
+        self._run_coroutine(self._do_connect(
+            params['host'], 
+            params['port'], 
+            params['username'], 
+            params['password'], 
+            params['key_file'], 
+            params['timeout']
+        ))
+    
+    async def _read_output_loop(self):
+        """
+        数据读取主循环(异步) - 已废弃，使用SSHSession回调
+        """
+        logger.warning("此方法已废弃，请使用SSHSession回调")
+    
+    def _start_heartbeat_task(self):
+        """启动心跳检测任务"""
+        self._heartbeat_task = asyncio.run_coroutine_threadsafe(
+            self._heartbeat_loop(),
+            self._loop
         )
-        self._read_thread.start()
-        logger.debug("数据读取线程已启动")
+        logger.debug("心跳检测任务已启动")
     
-    def _read_output_loop(self):
+    async def _heartbeat_loop(self):
         """
-        数据读取主循环(优化版)
-        
-        特性:
-        - 自适应轮询间隔(降低CPU占用)
-        - 大数据块读取(减少系统调用)
-        - 编码容错处理
-        - 活动检测(用于心跳)
-        """
-        logger.debug("数据读取循环开始")
-        
-        adaptive_poll_interval = self._read_poll_interval
-        consecutive_empty_reads = 0
-        
-        while self._running and self.is_connected:
-            try:
-                if not self.channel:
-                    logger.warning("Channel为空,退出读取循环")
-                    break
-                
-                # 检查channel是否可用
-                if self.channel.closed:
-                    logger.warning("Channel已关闭,退出读取循环")
-                    break
-                
-                # 读取数据
-                if self.channel.recv_ready():
-                    # 有大块数据时,一次性读取更多
-                    try:
-                        data = self.channel.recv(self._read_buffer_size)
-                        
-                        if data:
-                            # 重置空闲计数
-                            consecutive_empty_reads = 0
-                            adaptive_poll_interval = self._read_poll_interval
-                            
-                            # 更新活动时间
-                            self._last_activity_time = time.time()
-                            
-                            # 解码数据(UTF-8优先,Latin-1降级)
-                            try:
-                                text = data.decode('utf-8')
-                            except UnicodeDecodeError:
-                                # UTF-8解码失败,尝试Latin-1(不会失败)
-                                text = data.decode('latin-1')
-                            
-                            # 发送数据信号
-                            self.data_received.emit(text)
-                            
-                            # 清空发送队列
-                            self._flush_send_queue()
-                        else:
-                            # 收到空数据,连接可能已断开
-                            logger.warning("收到空数据,连接可能已断开")
-                            break
-                    except Exception as e:
-                        logger.error(f"读取数据异常: {e}", exc_info=True)
-                        break
-                else:
-                    # 没有数据可读
-                    consecutive_empty_reads += 1
-                    
-                    # 自适应调整轮询间隔
-                    if consecutive_empty_reads > 100:  # 约0.5秒无数据
-                        adaptive_poll_interval = min(
-                            adaptive_poll_interval * 1.5,
-                            self._max_idle_poll_interval
-                        )
-                    
-                    # 短暂休眠
-                    time.sleep(adaptive_poll_interval)
-                    
-            except socket.timeout:
-                # 超时是正常的,继续循环
-                continue
-            except EOFError:
-                logger.info("收到EOF,连接已关闭")
-                break
-            except Exception as e:
-                if self._running:
-                    logger.error(f"读取循环异常: {e}", exc_info=True)
-                    self.error_occurred.emit(f"读取数据错误: {str(e)}")
-                break
-        
-        # 循环结束,处理断开
-        logger.info("数据读取循环结束")
-        self._on_connection_lost()
-    
-    def _flush_send_queue(self):
-        """刷新发送队列(批量发送)"""
-        try:
-            while not self._send_queue.empty():
-                data = self._send_queue.get_nowait()
-                if self.channel and not self.channel.closed:
-                    self.channel.send(data)
-                self._send_queue.task_done()
-        except Exception as e:
-            logger.error(f"刷新发送队列失败: {e}")
-    
-    def _start_heartbeat_thread(self):
-        """启动心跳检测线程"""
-        self._heartbeat_thread = threading.Thread(
-            target=self._heartbeat_loop,
-            daemon=True,
-            name=f"SSH-Heartbeat-{self.session_info.get('host', 'unknown')}"
-        )
-        self._heartbeat_thread.start()
-        logger.debug("心跳检测线程已启动")
-    
-    def _heartbeat_loop(self):
-        """
-        心跳检测循环
+        心跳检测循环(异步)
         
         功能:
         - 定期发送心跳包
@@ -425,9 +385,9 @@ class SSHConnection(QObject):
         """
         logger.debug("心跳检测循环开始")
         
-        while self._running and self.is_connected:
-            try:
-                time.sleep(self.heartbeat_interval)
+        try:
+            while self._running and self.is_connected:
+                await asyncio.sleep(self.heartbeat_interval)
                 
                 if not self._running or not self.is_connected:
                     break
@@ -436,7 +396,7 @@ class SSHConnection(QObject):
                 time_since_activity = current_time - self._last_activity_time
                 
                 # 检查是否超时
-                if time_since_activity > self.heartbeat_timeout:
+                if time_since_activity > self.heartbeat_interval * 3:
                     logger.warning(f"连接超时({time_since_activity:.1f}秒无活动)")
                     
                     if self.auto_reconnect:
@@ -445,47 +405,53 @@ class SSHConnection(QObject):
                         self._on_connection_lost()
                     break
                 
-                # 发送心跳(通过transport)
-                if self.transport and self.transport.is_active():
+                # 发送心跳(通过connection)
+                if self.conn:
                     try:
-                        self.transport.send_ignore()
+                        # AsyncSSH没有直接的ping方法,发送keepalive
+                        await self.conn.ping()
                         self._last_heartbeat_time = current_time
                         logger.debug("心跳发送成功")
                     except Exception as e:
                         logger.warning(f"心跳发送失败: {e}")
-                        # 可能是连接问题,尝试重连
                         if self.auto_reconnect:
                             self._trigger_reconnect()
                         break
                         
-            except Exception as e:
-                logger.error(f"心跳循环异常: {e}", exc_info=True)
-                break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"心跳循环异常: {e}", exc_info=True)
         
         logger.debug("心跳检测循环结束")
     
     def send_data(self, data: str):
         """
-        发送数据到SSH服务器(线程安全)
+        发送数据到SSH服务器
         
         Args:
             data: 要发送的字符串
         """
-        if not self.is_connected or not self.channel:
+        if not self.is_connected or not self.chan:
             logger.warning("连接未建立,无法发送数据")
             return
         
-        # 调试: 记录发送的数据
-        # print(f"[SEND DEBUG] 发送数据: {repr(data)}")
-        
         try:
-            # 直接发送(低延迟)
-            if self.channel and not self.channel.closed:
-                self.channel.send(data)
-                self._last_activity_time = time.time()
+            # 在异步线程中发送
+            asyncio.run_coroutine_threadsafe(
+                self._send_data_async(data),
+                self._loop
+            )
         except Exception as e:
             logger.error(f"发送数据失败: {e}")
             self.error_occurred.emit(f"发送数据失败: {str(e)}")
+    
+    async def _send_data_async(self, data: str):
+        """异步发送数据"""
+        if self.chan:
+            self.chan.write(data)
+            await self.chan.drain()
+            self._last_activity_time = time.time()
     
     def disconnect(self):
         """优雅地断开SSH连接"""
@@ -497,57 +463,50 @@ class SSHConnection(QObject):
         self._running = False
         self.auto_reconnect = False  # 禁用自动重连
         
-        # 等待线程结束
-        if self._read_thread and self._read_thread.is_alive():
-            self._read_thread.join(timeout=3)
+        # 取消异步任务
+        if self._read_task:
+            self._read_task.cancel()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
         
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2)
-        
-        # 关闭channel
-        if self.channel:
+        # 关闭连接
+        if self._loop and self._loop.is_running():
             try:
-                self.channel.close()
+                asyncio.run_coroutine_threadsafe(
+                    self._close_connection(),
+                    self._loop
+                ).result(timeout=5)
             except Exception as e:
-                logger.debug(f"关闭channel异常: {e}")
-            finally:
-                self.channel = None
-        
-        # 关闭transport
-        if self.transport:
-            try:
-                self.transport.close()
-            except Exception as e:
-                logger.debug(f"关闭transport异常: {e}")
-            finally:
-                self.transport = None
-        
-        # 关闭client
-        if self.client:
-            try:
-                self.client.close()
-            except Exception as e:
-                logger.debug(f"关闭client异常: {e}")
-            finally:
-                self.client = None
-        
-        # 清空队列
-        self._clear_send_queue()
+                logger.debug(f"关闭连接异常: {e}")
         
         # 更新状态
         self._set_state(self.STATE_DISCONNECTED)
         self.connection_status.emit(self.STATE_DISCONNECTED)
         
+        # 停止异步事件循环
+        self._stop_asyncio_loop()
+        
         logger.info("SSH连接已断开")
     
-    def _clear_send_queue(self):
-        """清空发送队列"""
-        while not self._send_queue.empty():
+    async def _close_connection(self):
+        """异步关闭连接"""
+        if self.process:
             try:
-                self._send_queue.get_nowait()
-                self._send_queue.task_done()
-            except:
-                break
+                self.process.close()
+                await self.process.wait_closed()
+            except Exception as e:
+                logger.debug(f"关闭process异常: {e}")
+            finally:
+                self.process = None
+        
+        if self.conn:
+            try:
+                self.conn.close()
+                await self.conn.wait_closed()
+            except Exception as e:
+                logger.debug(f"关闭connection异常: {e}")
+            finally:
+                self.conn = None
     
     def _on_connection_lost(self):
         """连接丢失时的处理"""
@@ -588,17 +547,14 @@ class SSHConnection(QObject):
         self._set_state(self.STATE_RECONNECTING)
         
         # 在延迟后重连
-        reconnect_thread = threading.Thread(
-            target=self._delayed_reconnect,
-            args=(delay,),
-            daemon=True,
-            name=f"SSH-Reconnect-{self.session_info.get('host', 'unknown')}"
+        asyncio.run_coroutine_threadsafe(
+            self._delayed_reconnect(delay),
+            self._loop
         )
-        reconnect_thread.start()
     
-    def _delayed_reconnect(self, delay: float):
-        """延迟后执行重连"""
-        time.sleep(delay)
+    async def _delayed_reconnect(self, delay: float):
+        """延迟后执行重连(异步)"""
+        await asyncio.sleep(delay)
         
         if not self.auto_reconnect:
             return
@@ -607,14 +563,13 @@ class SSHConnection(QObject):
         
         # 使用保存的参数重连
         params = self._connect_params
-        self.connect(
+        await self._do_connect(
             host=params['host'],
             port=params['port'],
             username=params['username'],
             password=params.get('password'),
             key_file=params.get('key_file'),
-            timeout=params['timeout'],
-            auto_reconnect=True
+            timeout=params['timeout']
         )
     
     def resize_terminal(self, width: int, height: int):
@@ -625,14 +580,22 @@ class SSHConnection(QObject):
             width: 终端宽度(字符数)
             height: 终端高度(行数)
         """
-        if self.is_connected and self.channel:
+        if self.is_connected and self.conn:
             try:
-                self.channel.resize_pty(width=width, height=height)
+                asyncio.run_coroutine_threadsafe(
+                    self._resize_terminal_async(width, height),
+                    self._loop
+                )
                 self.term_width = width
                 self.term_height = height
                 logger.debug(f"终端大小已调整: {width}x{height}")
             except Exception as e:
                 logger.error(f"调整终端大小失败: {e}")
+    
+    async def _resize_terminal_async(self, width: int, height: int):
+        """异步调整终端大小"""
+        if self.process:
+            self.process.change_terminal_size(width, height)
     
     def get_session_info(self) -> dict:
         """获取会话信息"""
@@ -641,7 +604,3 @@ class SSHConnection(QObject):
     def __del__(self):
         """析构函数: 确保连接被清理"""
         self.disconnect()
-
-
-# 导入socket(用于异常处理)
-import socket

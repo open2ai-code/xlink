@@ -7,13 +7,13 @@ SFTP文件管理模块
 - SftpFileManagerWindow: SFTP文件管理独立窗口
 """
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QToolBar, QToolButton, QFileDialog, QMessageBox, QProgressBar,
     QLabel, QHeaderView, QMenu, QSplitter, QDockWidget, QDialog
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
-from PyQt6.QtGui import QAction, QIcon, QStandardItemModel, QStandardItem
+from PySide6.QtCore import Qt, Signal as pyqtSignal, QThread
+from PySide6.QtGui import QAction, QIcon, QStandardItemModel, QStandardItem
 from datetime import datetime
 import os
 from typing import List, Dict
@@ -509,7 +509,7 @@ class SftpFileManager(QFrame):
             self, "选择父目录"
         )
         
-        from PyQt6.QtWidgets import QInputDialog
+        from PySide6.QtWidgets import QInputDialog
         dir_name, ok = QInputDialog.getText(
             self, "新建文件夹", "请输入文件夹名称:"
         )

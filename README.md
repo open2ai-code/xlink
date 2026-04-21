@@ -5,8 +5,8 @@
 ## 技术栈
 
 - Python 3.10+
-- PyQt6 (GUI框架)
-- paramiko (SSH连接)
+- PySide6 (GUI框架)
+- AsyncSSH (SSH连接)
 - JSON配置持久化
 - 支持PyInstaller打包
 

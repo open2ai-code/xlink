@@ -7,9 +7,9 @@
 
 import time
 from core.logger import get_logger
-from PyQt6.QtWidgets import QWidget, QMenu, QScrollBar
-from PyQt6.QtCore import Qt, pyqtSignal, QTimer
-from PyQt6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction, QWheelEvent
+from PySide6.QtWidgets import QWidget, QMenu, QScrollBar
+from PySide6.QtCore import Qt, Signal as pyqtSignal, QTimer
+from PySide6.QtGui import QPainter, QColor, QFont, QFontMetrics, QAction, QWheelEvent
 from core.virtual_screen import VirtualScreen
 from core.terminal_buffer import ANSIParser
 from core.ssh_manager import SSHConnection
@@ -144,11 +144,11 @@ class NativeTerminalWidget(QWidget):
         重写event方法,拦截Tab键的默认焦点切换行为
         确保Tab键传递给keyPressEvent处理
         """
-        from PyQt6.QtCore import QEvent
+        from PySide6.QtCore import QEvent
         
         # 拦截KeyPress事件中的Tab键
         if event.type() == QEvent.Type.KeyPress:
-            from PyQt6.QtGui import QKeyEvent
+            from PySide6.QtGui import QKeyEvent
             if isinstance(event, QKeyEvent):
                 if event.key() == Qt.Key.Key_Tab:
                     # 直接处理Tab键,阻止Qt的默认焦点切换
@@ -842,7 +842,7 @@ class NativeTerminalWidget(QWidget):
     
     def _paste_from_clipboard(self):
         """从剪贴板粘贴"""
-        from PyQt6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication
         clipboard = QApplication.clipboard()
         text = clipboard.text()
         if text and self.ssh_connection:
@@ -998,7 +998,7 @@ class NativeTerminalWidget(QWidget):
     
     def mousePressEvent(self, event):
         """鼠标按下事件 - 开始文本选择"""
-        from PyQt6.QtCore import Qt
+        from PySide6.QtCore import Qt
         
         if event.button() == Qt.MouseButton.LeftButton:
             # 计算点击位置的行列坐标
@@ -1026,7 +1026,7 @@ class NativeTerminalWidget(QWidget):
     
     def mouseDoubleClickEvent(self, event):
         """鼠标双击事件 - 选择单词"""
-        from PyQt6.QtCore import Qt
+        from PySide6.QtCore import Qt
         
         if event.button() == Qt.MouseButton.LeftButton:
             # 计算点击位置的行列坐标
@@ -1068,7 +1068,7 @@ class NativeTerminalWidget(QWidget):
     
     def mouseMoveEvent(self, event):
         """鼠标移动事件 - 扩展文本选择"""
-        from PyQt6.QtCore import Qt
+        from PySide6.QtCore import Qt
         
         if self._is_selecting and (event.buttons() & Qt.MouseButton.LeftButton):
             # 计算移动位置的行列坐标
@@ -1093,7 +1093,7 @@ class NativeTerminalWidget(QWidget):
     
     def mouseReleaseEvent(self, event):
         """鼠标释放事件 - 完成文本选择"""
-        from PyQt6.QtCore import Qt
+        from PySide6.QtCore import Qt
         
         if event.button() == Qt.MouseButton.LeftButton and self._is_selecting:
             # 结束选择
@@ -1227,7 +1227,7 @@ class NativeTerminalWidget(QWidget):
     
     def copy(self):
         """复制选中的文本到剪贴板"""
-        from PyQt6.QtWidgets import QApplication
+        from PySide6.QtWidgets import QApplication
         
         if self._has_selection:
             selected_text = self._get_selected_text()

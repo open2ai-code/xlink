@@ -4,7 +4,7 @@ XLink - SSH客户端
 主入口程序
 
 轻量、稳定、高颜值的SSH远程连接工具
-技术栈: Python 3.10+ | PyQt6 | paramiko
+技术栈: Python 3.10+ | PySide6 | AsyncSSH
 """
 
 import sys
@@ -14,9 +14,9 @@ import os
 project_root = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, project_root)
 
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from ui.main_window import MainWindow
 from core.logger import Logger, get_logger
 
@@ -35,7 +35,7 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
-    # 注意: PyQt6中这些属性已经默认启用,不需要手动设置
+    # 注意: PySide6中这些属性已经默认启用,不需要手动设置
     # QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
     # QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     

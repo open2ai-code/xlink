@@ -4,8 +4,8 @@
 支持多种光标样式: 块状、竖线、下划线
 """
 
-from PyQt6.QtGui import QPainter, QColor
-from PyQt6.QtCore import Qt
+from PySide6.QtGui import QPainter, QColor
+from PySide6.QtCore import Qt
 
 
 class CursorRenderer:

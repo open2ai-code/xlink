@@ -4,9 +4,9 @@
 管理多终端标签页
 """
 
-from PyQt6.QtWidgets import QTabWidget, QMenu, QFrame, QVBoxLayout
-from PyQt6.QtCore import pyqtSignal, Qt
-from PyQt6.QtGui import QAction
+from PySide6.QtWidgets import QTabWidget, QMenu, QFrame, QVBoxLayout
+from PySide6.QtCore import Signal as pyqtSignal, Qt
+from PySide6.QtGui import QAction
 from ui.terminal_widget import TerminalWidget
 from core.ssh_manager import SSHConnection
 

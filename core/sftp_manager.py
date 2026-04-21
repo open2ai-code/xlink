@@ -1,15 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-SFTP文件管理模块
-封装paramiko的SFTPClient,提供文件传输和目录操作功能
+SFTP文件管理模块 - AsyncSSH版本
+封装asyncssh的SFTP功能,提供文件传输和目录操作功能
 """
 
 import os
+import asyncio
+import threading
 import stat
 from pathlib import Path
 from typing import List, Dict, Optional, Callable
-from PyQt6.QtCore import QObject, pyqtSignal
-import paramiko
+from PySide6.QtCore import QObject, Signal as pyqtSignal
+import asyncssh
 from core.logger import get_logger
 
 
@@ -17,7 +19,7 @@ logger = get_logger("SFTPManager")
 
 
 class SFTPManager(QObject):
-    """SFTP连接和文件操作管理器"""
+    """SFTP连接和文件操作管理器(AsyncSSH版本)"""
     
     # 信号定义
     connected = pyqtSignal()
@@ -28,10 +30,42 @@ class SFTPManager(QObject):
     
     def __init__(self):
         super().__init__()
-        self.ssh_client = None
-        self.sftp_client = None
+        self.conn = None
+        self.sftp = None
+        
+        # 异步事件循环和线程
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._ready_event = threading.Event()
+        
         self.is_connected = False
         self.current_path = "/"
+    
+    def _start_asyncio_loop(self):
+        """启动异步事件循环线程"""
+        def run_loop():
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._ready_event.set()
+            self._loop.run_forever()
+        
+        self._thread = threading.Thread(target=run_loop, daemon=True, name="SFTP-AsyncIO")
+        self._thread.start()
+        self._ready_event.wait()
+    
+    def _stop_asyncio_loop(self):
+        """停止异步事件循环"""
+        if self._loop and self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=3)
+    
+    def _run_coroutine(self, coro):
+        """在异步线程中运行协程"""
+        if not self._loop:
+            raise RuntimeError("异步事件循环未启动")
+        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        return future.result(timeout=30)
     
     def connect(self, hostname: str, port: int, username: str, 
                 password: str = None, key_file: str = None) -> bool:
@@ -48,38 +82,38 @@ class SFTPManager(QObject):
         Returns:
             连接是否成功
         """
+        # 启动异步事件循环
+        if not self._loop:
+            self._start_asyncio_loop()
+        
         try:
             logger.info(f"正在连接SFTP服务器: {hostname}:{port}")
             
-            # 创建SSH客户端
-            self.ssh_client = paramiko.SSHClient()
-            self.ssh_client.set_missing_host_key_policy(
-                paramiko.AutoAddPolicy()
-            )
-            
             # 连接参数
             connect_kwargs = {
-                'hostname': hostname,
+                'host': hostname,
                 'port': port,
                 'username': username,
-                'timeout': 10
+                'known_hosts': None,
+                'connect_timeout': 10
             }
             
             if password:
                 connect_kwargs['password'] = password
             elif key_file:
-                connect_kwargs['key_filename'] = key_file
+                connect_kwargs['client_keys'] = [key_file]
             
-            # 建立连接
-            self.ssh_client.connect(**connect_kwargs)
+            # 建立连接并打开SFTP
+            result = self._run_coroutine(self._do_connect(**connect_kwargs))
             
-            # 打开SFTP会话
-            self.sftp_client = self.ssh_client.open_sftp()
-            self.is_connected = True
-            
-            logger.info("SFTP连接成功")
-            self.connected.emit()
-            return True
+            if result:
+                self.is_connected = True
+                logger.info("SFTP连接成功")
+                self.connected.emit()
+                return True
+            else:
+                self.is_connected = False
+                return False
             
         except Exception as e:
             error_msg = f"SFTP连接失败: {str(e)}"
@@ -88,16 +122,23 @@ class SFTPManager(QObject):
             self.is_connected = False
             return False
     
+    async def _do_connect(self, **kwargs):
+        """异步执行连接"""
+        try:
+            self.conn = await asyncssh.connect(**kwargs)
+            self.sftp = await self.conn.start_sftp_client()
+            return True
+        except Exception as e:
+            error_msg = f"SFTP连接失败: {str(e)}"
+            logger.error(error_msg)
+            self.error_occurred.emit(error_msg)
+            return False
+    
     def disconnect(self):
         """断开SFTP连接"""
         try:
-            if self.sftp_client:
-                self.sftp_client.close()
-                self.sftp_client = None
-            
-            if self.ssh_client:
-                self.ssh_client.close()
-                self.ssh_client = None
+            if self._loop and self._loop.is_running():
+                self._run_coroutine(self._do_disconnect())
             
             self.is_connected = False
             logger.info("SFTP连接已断开")
@@ -105,6 +146,17 @@ class SFTPManager(QObject):
             
         except Exception as e:
             logger.error(f"断开SFTP连接失败: {e}")
+    
+    async def _do_disconnect(self):
+        """异步断开连接"""
+        if self.sftp:
+            await self.sftp.close()
+            self.sftp = None
+        
+        if self.conn:
+            self.conn.close()
+            await self.conn.wait_closed()
+            self.conn = None
     
     def list_directory(self, path: str = None) -> List[Dict]:
         """
@@ -122,20 +174,7 @@ class SFTPManager(QObject):
         
         try:
             target_path = path if path else self.current_path
-            items = []
-            
-            for attr in self.sftp_client.listdir_attr(target_path):
-                item = {
-                    'name': attr.filename,
-                    'size': attr.st_size,
-                    'mtime': attr.st_mtime,
-                    'is_dir': stat.S_ISDIR(attr.st_mode),
-                    'permissions': stat.filemode(attr.st_mode)
-                }
-                items.append(item)
-            
-            # 按名称排序,文件夹在前
-            items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+            items = self._run_coroutine(self._do_list_directory(target_path))
             
             self.current_path = target_path
             logger.debug(f"列出目录 {target_path}: {len(items)} 个项目")
@@ -146,6 +185,25 @@ class SFTPManager(QObject):
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
             return []
+    
+    async def _do_list_directory(self, path: str) -> List[Dict]:
+        """异步列出目录"""
+        items = []
+        
+        for attr in await self.sftp.readdir(path):
+            item = {
+                'name': attr.filename,
+                'size': attr.size,
+                'mtime': attr.mtime,
+                'is_dir': stat.S_ISDIR(attr.permissions),
+                'permissions': stat.filemode(attr.permissions)
+            }
+            items.append(item)
+        
+        # 按名称排序,文件夹在前
+        items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
+        
+        return items
     
     def upload_file(self, local_path: str, remote_path: str, 
                     progress_callback: Callable = None) -> bool:
@@ -177,16 +235,30 @@ class SFTPManager(QObject):
                     progress_callback(transferred, file_size)
             
             # 上传文件
-            self.sftp_client.put(local_path, remote_path, callback=callback)
+            result = self._run_coroutine(
+                self._do_upload(local_path, remote_path, callback)
+            )
             
-            logger.info(f"文件上传成功: {remote_path}")
-            self.operation_completed.emit("upload")
-            return True
+            if result:
+                logger.info(f"文件上传成功: {remote_path}")
+                self.operation_completed.emit("upload")
+                return True
+            else:
+                return False
             
         except Exception as e:
             error_msg = f"上传文件失败: {str(e)}"
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
+            return False
+    
+    async def _do_upload(self, local_path, remote_path, callback):
+        """异步上传文件"""
+        try:
+            await self.sftp.put(local_path, remote_path)
+            return True
+        except Exception as e:
+            logger.error(f"上传失败: {e}")
             return False
     
     def download_file(self, remote_path: str, local_path: str,
@@ -210,7 +282,8 @@ class SFTPManager(QObject):
             logger.info(f"下载文件: {remote_path} -> {local_path}")
             
             # 获取文件大小
-            file_size = self.sftp_client.stat(remote_path).st_size
+            file_attr = self._run_coroutine(self.sftp.stat(remote_path))
+            file_size = file_attr.size
             
             # 定义进度回调
             def callback(transferred, total):
@@ -219,16 +292,30 @@ class SFTPManager(QObject):
                     progress_callback(transferred, file_size)
             
             # 下载文件
-            self.sftp_client.get(remote_path, local_path, callback=callback)
+            result = self._run_coroutine(
+                self._do_download(remote_path, local_path, callback)
+            )
             
-            logger.info(f"文件下载成功: {local_path}")
-            self.operation_completed.emit("download")
-            return True
+            if result:
+                logger.info(f"文件下载成功: {local_path}")
+                self.operation_completed.emit("download")
+                return True
+            else:
+                return False
             
         except Exception as e:
             error_msg = f"下载文件失败: {str(e)}"
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
+            return False
+    
+    async def _do_download(self, remote_path, local_path, callback):
+        """异步下载文件"""
+        try:
+            await self.sftp.get(remote_path, local_path)
+            return True
+        except Exception as e:
+            logger.error(f"下载失败: {e}")
             return False
     
     def delete(self, path: str, is_dir: bool = False) -> bool:
@@ -247,16 +334,18 @@ class SFTPManager(QObject):
             return False
         
         try:
-            if is_dir:
-                # 递归删除文件夹
-                self._remove_dir_recursive(path)
-                logger.info(f"删除文件夹成功: {path}")
-            else:
-                self.sftp_client.remove(path)
-                logger.info(f"删除文件成功: {path}")
+            result = self._run_coroutine(self._do_delete(path, is_dir))
             
-            self.operation_completed.emit("delete")
-            return True
+            if result:
+                if is_dir:
+                    logger.info(f"删除文件夹成功: {path}")
+                else:
+                    logger.info(f"删除文件成功: {path}")
+                
+                self.operation_completed.emit("delete")
+                return True
+            else:
+                return False
             
         except Exception as e:
             error_msg = f"删除失败: {str(e)}"
@@ -264,15 +353,27 @@ class SFTPManager(QObject):
             self.error_occurred.emit(error_msg)
             return False
     
-    def _remove_dir_recursive(self, path: str):
-        """递归删除文件夹"""
-        for item in self.sftp_client.listdir_attr(path):
-            item_path = path + '/' + item.filename
-            if stat.S_ISDIR(item.st_mode):
-                self._remove_dir_recursive(item_path)
+    async def _do_delete(self, path: str, is_dir: bool):
+        """异步删除文件或文件夹"""
+        try:
+            if is_dir:
+                await self._remove_dir_recursive(path)
             else:
-                self.sftp_client.remove(item_path)
-        self.sftp_client.rmdir(path)
+                await self.sftp.remove(path)
+            return True
+        except Exception as e:
+            logger.error(f"删除失败: {e}")
+            return False
+    
+    async def _remove_dir_recursive(self, path: str):
+        """递归删除文件夹"""
+        for attr in await self.sftp.readdir(path):
+            item_path = path.rstrip('/') + '/' + attr.filename
+            if stat.S_ISDIR(attr.permissions):
+                await self._remove_dir_recursive(item_path)
+            else:
+                await self.sftp.remove(item_path)
+        await self.sftp.rmdir(path)
     
     def mkdir(self, path: str) -> bool:
         """
@@ -289,15 +390,28 @@ class SFTPManager(QObject):
             return False
         
         try:
-            self.sftp_client.mkdir(path)
-            logger.info(f"创建文件夹成功: {path}")
-            self.operation_completed.emit("mkdir")
-            return True
+            result = self._run_coroutine(self._do_mkdir(path))
+            
+            if result:
+                logger.info(f"创建文件夹成功: {path}")
+                self.operation_completed.emit("mkdir")
+                return True
+            else:
+                return False
             
         except Exception as e:
             error_msg = f"创建文件夹失败: {str(e)}"
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
+            return False
+    
+    async def _do_mkdir(self, path: str):
+        """异步创建文件夹"""
+        try:
+            await self.sftp.mkdir(path)
+            return True
+        except Exception as e:
+            logger.error(f"创建文件夹失败: {e}")
             return False
     
     def rename(self, old_path: str, new_path: str) -> bool:
@@ -316,15 +430,28 @@ class SFTPManager(QObject):
             return False
         
         try:
-            self.sftp_client.rename(old_path, new_path)
-            logger.info(f"重命名成功: {old_path} -> {new_path}")
-            self.operation_completed.emit("rename")
-            return True
+            result = self._run_coroutine(self._do_rename(old_path, new_path))
+            
+            if result:
+                logger.info(f"重命名成功: {old_path} -> {new_path}")
+                self.operation_completed.emit("rename")
+                return True
+            else:
+                return False
             
         except Exception as e:
             error_msg = f"重命名失败: {str(e)}"
             logger.error(error_msg)
             self.error_occurred.emit(error_msg)
+            return False
+    
+    async def _do_rename(self, old_path: str, new_path: str):
+        """异步重命名"""
+        try:
+            await self.sftp.rename(old_path, new_path)
+            return True
+        except Exception as e:
+            logger.error(f"重命名失败: {e}")
             return False
     
     def get_current_path(self) -> str:
@@ -346,7 +473,16 @@ class SFTPManager(QObject):
         
         try:
             # 检查目录是否存在
-            self.sftp_client.stat(path)
+            result = self._run_coroutine(self._do_change_directory(path))
+            return result
+        except Exception as e:
+            logger.error(f"切换目录失败: {e}")
+            return False
+    
+    async def _do_change_directory(self, path: str):
+        """异步切换目录"""
+        try:
+            await self.sftp.stat(path)
             self.current_path = path
             logger.debug(f"切换目录到: {path}")
             return True
@@ -368,24 +504,23 @@ class SFTPManager(QObject):
             return []
         
         try:
-            tree = []
-            self._build_directory_tree(start_path, tree)
+            tree = self._run_coroutine(self._do_get_directory_tree(start_path))
             return tree
         except Exception as e:
             logger.error(f"获取目录树失败: {e}")
             return []
     
-    def _build_directory_tree(self, path: str, tree_list: List[Dict]):
-        """
-        递归构建目录树
-        
-        Args:
-            path: 当前路径
-            tree_list: 树列表(输出)
-        """
+    async def _do_get_directory_tree(self, start_path: str) -> List[Dict]:
+        """异步获取目录树"""
+        tree = []
+        await self._build_directory_tree(start_path, tree)
+        return tree
+    
+    async def _build_directory_tree(self, path: str, tree_list: List[Dict]):
+        """异步递归构建目录树"""
         try:
-            for attr in self.sftp_client.listdir_attr(path):
-                if stat.S_ISDIR(attr.st_mode):
+            for attr in await self.sftp.readdir(path):
+                if stat.S_ISDIR(attr.permissions):
                     dir_name = attr.filename
                     dir_path = path.rstrip('/') + '/' + dir_name
                     
@@ -397,6 +532,6 @@ class SFTPManager(QObject):
                     tree_list.append(node)
                     
                     # 递归获取子目录
-                    self._build_directory_tree(dir_path, node['children'])
+                    await self._build_directory_tree(dir_path, node['children'])
         except Exception as e:
             logger.debug(f"读取目录 {path} 失败: {e}")

@@ -4,12 +4,12 @@
 整合所有UI组件,提供主界面布局
 """
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QMainWindow, QSplitter, QStatusBar, QMenuBar,
     QToolBar, QMessageBox, QLabel, QTabWidget, QFrame, QVBoxLayout
 )
-from PyQt6.QtCore import Qt, QSize
-from PyQt6.QtGui import QAction, QFont
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QAction, QFont
 from ui.theme import ThemeManager
 from ui.session_panel import SessionPanel
 from ui.tab_manager import TabManager
@@ -350,7 +350,7 @@ class MainWindow(QMainWindow):
             "<h2>XLink SSH客户端</h2>"
             "<p>版本: 1.0.0</p>"
             "<p>轻量、稳定、高颜值的SSH远程连接工具</p>"
-            "<p>技术栈: Python 3.10+ | PyQt6 | paramiko</p>"
+            "<p>技术栈: Python 3.10+ | PySide6 | AsyncSSH</p>"
             "<p>&copy; 2026 XLink Team</p>"
         )
     

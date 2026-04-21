@@ -105,8 +105,8 @@ class Logger:
             
             # 显示错误对话框 (如果在GUI环境中)
             try:
-                from PyQt6.QtWidgets import QApplication, QMessageBox
-                from PyQt6.QtCore import Qt
+                from PySide6.QtWidgets import QApplication, QMessageBox
+                from PySide6.QtCore import Qt
                 
                 app = QApplication.instance()
                 if app:

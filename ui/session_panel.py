@@ -4,11 +4,11 @@
 左侧会话列表树形控件
 """
 
-from PyQt6.QtWidgets import (
+from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QMenu, QMessageBox
 )
-from PyQt6.QtCore import pyqtSignal, Qt
-from PyQt6.QtGui import QAction
+from PySide6.QtCore import Signal as pyqtSignal, Qt
+from PySide6.QtGui import QAction
 from ui.dialogs import SessionDialog
 
 
