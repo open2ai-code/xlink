@@ -13,7 +13,6 @@ SSH连接管理模块 - AsyncSSH版本
 """
 
 import asyncio
-import threading
 import time
 from typing import Optional, Dict, Any
 import asyncssh
@@ -89,11 +88,6 @@ class SSHConnection(QObject):
         self.conn: Optional[asyncssh.SSHClientConnection] = None
         self.process: Optional[asyncssh.SSHClientProcess] = None
         
-        # 异步事件循环和线程
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._thread: Optional[threading.Thread] = None
-        self._ready_event = threading.Event()
-        
         # 连接状态
         self._state = self.STATE_DISCONNECTED
         self._running = False
@@ -124,31 +118,25 @@ class SSHConnection(QObject):
         
         logger.debug("SSHConnection实例已创建")
     
-    def _start_asyncio_loop(self):
-        """启动异步事件循环线程"""
-        def run_loop():
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
-            self._ready_event.set()
-            self._loop.run_forever()
-        
-        self._thread = threading.Thread(target=run_loop, daemon=True, name="SSH-AsyncIO")
-        self._thread.start()
-        self._ready_event.wait()  # 等待事件循环就绪
-    
-    def _stop_asyncio_loop(self):
-        """停止异步事件循环"""
-        if self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3)
+    def _get_event_loop(self) -> asyncio.AbstractEventLoop:
+        """获取当前事件循环"""
+        try:
+            return asyncio.get_event_loop()
+        except RuntimeError:
+            # 如果没有运行中的事件循环，创建一个新的
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            return loop
     
     def _run_coroutine(self, coro):
-        """在异步线程中运行协程"""
-        if not self._loop:
-            raise RuntimeError("异步事件循环未启动")
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        return future.result(timeout=30)
+        """在事件循环中运行协程"""
+        loop = self._get_event_loop()
+        if loop.is_running():
+            # 事件循环正在运行，使用create_task
+            return asyncio.ensure_future(coro)
+        else:
+            # 事件循环未运行，直接运行
+            return loop.run_until_complete(coro)
     
     @property
     def is_connected(self) -> bool:
@@ -183,10 +171,6 @@ class SSHConnection(QObject):
             timeout: 连接超时时间(秒)
             auto_reconnect: 是否启用自动重连
         """
-        # 启动异步事件循环
-        if not self._loop:
-            self._start_asyncio_loop()
-        
         # 保存连接参数(用于重连)
         self._connect_params = {
             'host': host,
@@ -205,8 +189,8 @@ class SSHConnection(QObject):
         
         self.auto_reconnect = auto_reconnect
         
-        # 在异步线程中执行连接
-        self._run_coroutine(self._do_connect(host, port, username, password, key_file, timeout))
+        # 使用asyncio.create_task异步执行连接
+        asyncio.ensure_future(self._do_connect(host, port, username, password, key_file, timeout))
     
     async def _do_connect(self, host: str, port: int, username: str,
                           password: Optional[str], key_file: Optional[str],
@@ -250,6 +234,8 @@ class SSHConnection(QObject):
                 term_size=(self.term_width, self.term_height),
                 encoding='utf-8'
             )
+            
+            logger.info(f"Shell会话已创建, chan={self.chan is not None}, process={self.process is not None}")
             
             # 更新状态
             self._set_state(self.STATE_CONNECTED)
@@ -368,10 +354,7 @@ class SSHConnection(QObject):
     
     def _start_heartbeat_task(self):
         """启动心跳检测任务"""
-        self._heartbeat_task = asyncio.run_coroutine_threadsafe(
-            self._heartbeat_loop(),
-            self._loop
-        )
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
         logger.debug("心跳检测任务已启动")
     
     async def _heartbeat_loop(self):
@@ -405,17 +388,17 @@ class SSHConnection(QObject):
                         self._on_connection_lost()
                     break
                 
-                # 发送心跳(通过connection)
+                # 发送心跳 - AsyncSSH使用keepalive_request
                 if self.conn:
                     try:
-                        # AsyncSSH没有直接的ping方法,发送keepalive
-                        await self.conn.ping()
+                        # 使用keepalive机制
+                        self.conn.keepalive_interval = self.heartbeat_interval
                         self._last_heartbeat_time = current_time
-                        logger.debug("心跳发送成功")
+                        logger.debug("心跳检查完成")
                     except Exception as e:
-                        logger.warning(f"心跳发送失败: {e}")
+                        logger.warning(f"心跳检查失败: {e}")
                         if self.auto_reconnect:
-                            self._trigger_reconnect()
+                            await self._trigger_reconnect()
                         break
                         
         except asyncio.CancelledError:
@@ -437,23 +420,14 @@ class SSHConnection(QObject):
             return
         
         try:
-            # 在异步线程中发送
-            asyncio.run_coroutine_threadsafe(
-                self._send_data_async(data),
-                self._loop
-            )
+            # 直接发送数据
+            self.chan.write(data)
+            self._last_activity_time = time.time()
         except Exception as e:
             logger.error(f"发送数据失败: {e}")
             self.error_occurred.emit(f"发送数据失败: {str(e)}")
     
-    async def _send_data_async(self, data: str):
-        """异步发送数据"""
-        if self.chan:
-            self.chan.write(data)
-            await self.chan.drain()
-            self._last_activity_time = time.time()
-    
-    def disconnect(self):
+    async def disconnect(self):
         """优雅地断开SSH连接"""
         if not self._running:
             return
@@ -464,27 +438,19 @@ class SSHConnection(QObject):
         self.auto_reconnect = False  # 禁用自动重连
         
         # 取消异步任务
-        if self._read_task:
-            self._read_task.cancel()
         if self._heartbeat_task:
             self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
         
         # 关闭连接
-        if self._loop and self._loop.is_running():
-            try:
-                asyncio.run_coroutine_threadsafe(
-                    self._close_connection(),
-                    self._loop
-                ).result(timeout=5)
-            except Exception as e:
-                logger.debug(f"关闭连接异常: {e}")
+        await self._close_connection()
         
         # 更新状态
         self._set_state(self.STATE_DISCONNECTED)
         self.connection_status.emit(self.STATE_DISCONNECTED)
-        
-        # 停止异步事件循环
-        self._stop_asyncio_loop()
         
         logger.info("SSH连接已断开")
     
@@ -508,23 +474,23 @@ class SSHConnection(QObject):
             finally:
                 self.conn = None
     
-    def _on_connection_lost(self):
+    def _on_connection_lost(self, exc=None):
         """连接丢失时的处理"""
         if not self._running:
             return
         
-        logger.warning("连接已丢失")
+        logger.warning(f"连接已丢失: {exc}")
         self._set_state(self.STATE_DISCONNECTED)
         self._running = False
         
         # 触发自动重连
         if self.auto_reconnect:
-            self._trigger_reconnect()
+            asyncio.ensure_future(self._trigger_reconnect())
         else:
             self.connection_status.emit(self.STATE_DISCONNECTED)
     
-    def _trigger_reconnect(self):
-        """触发重连(指数退避)"""
+    async def _trigger_reconnect(self):
+        """触发重连(指数退避) - 异步版本"""
         if not self._running:
             return
         
@@ -547,13 +513,6 @@ class SSHConnection(QObject):
         self._set_state(self.STATE_RECONNECTING)
         
         # 在延迟后重连
-        asyncio.run_coroutine_threadsafe(
-            self._delayed_reconnect(delay),
-            self._loop
-        )
-    
-    async def _delayed_reconnect(self, delay: float):
-        """延迟后执行重连(异步)"""
         await asyncio.sleep(delay)
         
         if not self.auto_reconnect:
@@ -580,12 +539,10 @@ class SSHConnection(QObject):
             width: 终端宽度(字符数)
             height: 终端高度(行数)
         """
-        if self.is_connected and self.conn:
+        if self.is_connected and self.chan:
             try:
-                asyncio.run_coroutine_threadsafe(
-                    self._resize_terminal_async(width, height),
-                    self._loop
-                )
+                # 直接调用异步方法
+                asyncio.ensure_future(self._resize_terminal_async(width, height))
                 self.term_width = width
                 self.term_height = height
                 logger.debug(f"终端大小已调整: {width}x{height}")
@@ -603,4 +560,10 @@ class SSHConnection(QObject):
     
     def __del__(self):
         """析构函数: 确保连接被清理"""
-        self.disconnect()
+        # disconnect现在是异步方法，在析构函数中无法await
+        # 直接关闭连接
+        if self.conn:
+            try:
+                self.conn.close()
+            except:
+                pass

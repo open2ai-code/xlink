@@ -9,6 +9,7 @@ XLink - SSH客户端
 
 import sys
 import os
+import asyncio
 
 # 添加项目根目录到Python路径
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -17,6 +18,7 @@ sys.path.insert(0, project_root)
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
+from qasync import QEventLoop
 from ui.main_window import MainWindow
 from core.logger import Logger, get_logger
 
@@ -35,12 +37,13 @@ def main():
     QApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
     )
-    # 注意: PySide6中这些属性已经默认启用,不需要手动设置
-    # QApplication.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-    # QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     
     # 创建应用实例
     app = QApplication(sys.argv)
+    
+    # 创建qasync事件循环 - 将asyncio集成到Qt事件循环中
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
     
     # 设置应用信息
     app.setApplicationName("XLink")
@@ -59,8 +62,9 @@ def main():
     
     logger.info("XLink SSH Client started successfully")
     
-    # 运行应用
-    sys.exit(app.exec())
+    # 使用qasync事件循环运行应用
+    with loop:
+        loop.run_forever()
 
 
 if __name__ == "__main__":

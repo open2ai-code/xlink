@@ -194,18 +194,20 @@ class NativeTerminalWidget(QWidget):
     
     def _on_ssh_data(self, data: str):
         """接收SSH数据"""
-        logger.debug(f"[SSH数据] 接收到 {len(data)} 字节数据")
+        logger.info(f"[SSH数据] 接收到 {len(data)} 字节数据, 前100字符: {repr(data[:100])}")
         self.receive_buffer += data
         
         # 解析ANSI序列
         segments = self.ansi_parser.parse(self.receive_buffer)
+        
+        logger.info(f"[SSH数据] 解析结果: {len(segments)} 个文本段, {len(self.ansi_parser.commands)} 个控制命令")
         
         if not segments and not self.ansi_parser.commands:
             # 没有完整的数据,等待更多
             logger.debug("[SSH数据] 数据不完整，等待更多")
             return
         
-        logger.debug(f"[SSH数据] 解析完成: {len(segments)} 个文本段, {len(self.ansi_parser.commands)} 个控制命令")
+        logger.info(f"[SSH数据] 解析完成: {len(segments)} 个文本段, {len(self.ansi_parser.commands)} 个控制命令")
         
         # 清空缓冲区
         self.receive_buffer = ""
@@ -242,7 +244,7 @@ class NativeTerminalWidget(QWidget):
         # 写入文本数据
         for segment in segments:
             if segment.text:
-                logger.debug(f"[SSH数据] 写入文本段: {len(segment.text)} 字符, 前50字符: {repr(segment.text[:50])}")
+                logger.info(f"[SSH数据] 写入文本段: {len(segment.text)} 字符, 前50字符: {repr(segment.text[:50])}")
                 # 检测并记录提示符
                 self._detect_and_record_prompt(segment.text)
                 
@@ -250,6 +252,7 @@ class NativeTerminalWidget(QWidget):
                 old_cursor_row = self.screen.cursor_row
                 old_cursor_col = self.screen.cursor_col
                 old_scrollback_len = len(self.screen.scrollback_buffer)
+                old_modified_rows_count = len(self.screen.modified_rows)
                 
                 # 正常写入文本
                 self.screen.write_text(segment.text, {
@@ -263,6 +266,9 @@ class NativeTerminalWidget(QWidget):
                 new_cursor_row = self.screen.cursor_row
                 new_cursor_col = self.screen.cursor_col
                 new_scrollback_len = len(self.screen.scrollback_buffer)
+                new_modified_rows_count = len(self.screen.modified_rows)
+                
+                logger.info(f"[SSH数据] 屏幕状态变化: 光标({old_cursor_row},{old_cursor_col})->({new_cursor_row},{new_cursor_col}), 修改行:{old_modified_rows_count}->{new_modified_rows_count}")
                 
                 if old_scrollback_len != new_scrollback_len:
                     logger.debug(f"[SSH数据] 滚动缓冲区变化: {old_scrollback_len} -> {new_scrollback_len} 行")

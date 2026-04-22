@@ -134,11 +134,13 @@ class TabManager(QTabWidget):
         
         # 清理SSH连接
         # 遍历所有连接,找到属于这个容器的
+        import asyncio
         widgets_to_remove = []
         for widget, connection in list(self.connections.items()):
             # 检查widget是否在这个容器中
             if widget.parent() == container or widget.parent().parent() == container:
-                connection.disconnect()
+                # disconnect现在是异步方法
+                asyncio.ensure_future(connection.disconnect())
                 widgets_to_remove.append(widget)
         
         for widget in widgets_to_remove:
@@ -238,6 +240,8 @@ class TabManager(QTabWidget):
     
     def close_all_connections(self):
         """关闭所有SSH连接"""
+        import asyncio
         for connection in self.connections.values():
-            connection.disconnect()
+            # disconnect现在是异步方法
+            asyncio.ensure_future(connection.disconnect())
         self.connections.clear()

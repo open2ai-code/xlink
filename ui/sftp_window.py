@@ -32,6 +32,7 @@ class SftpFileManager(QFrame):
         
         self.sftp_manager = SFTPManager()
         self.current_session = None
+        self._initial_auto_select_done = False  # 标记是否已完成首次自动定位
         
         self._init_ui()
         self._connect_signals()
@@ -145,13 +146,16 @@ class SftpFileManager(QFrame):
         # 双击展开/折叠
         self.dir_tree.itemDoubleClicked.connect(self._on_dir_tree_double_clicked)
         
+        # 展开节点时加载子目录
+        self.dir_tree.itemExpanded.connect(self._on_dir_tree_expanded)
+        
         tree_layout.addWidget(self.dir_tree)
         
         # 添加到父容器
         parent.addWidget(tree_frame)
     
     def _load_directory_tree(self):
-        """加载目录树(懒加载模式)"""
+        """加载目录树(懒加载模式 - 只加载根目录)"""
         if not self.sftp_manager.is_connected:
             return
         
@@ -164,60 +168,284 @@ class SftpFileManager(QFrame):
         root_item.setData(0, Qt.ItemDataRole.UserRole, {"path": "/", "name": "/"})
         root_item.setExpanded(True)
         
-        # 只加载根目录的子目录(不递归)
-        self._load_children_for_node(root_item, "/")
+        # 异步加载根目录的子文件夹
+        import asyncio
+        asyncio.ensure_future(self._load_subdirs_async("/", root_item, None))
     
     def _load_children_for_node(self, parent_item: QTreeWidgetItem, path: str):
         """
-        为节点加载子目录(只加载一层)
+        为节点加载子目录(懒加载模式)
         
         Args:
             parent_item: 父节点
             path: 父目录路径
         """
         try:
-            # 获取该目录下的子目录
-            items = self.sftp_manager.list_directory(path)
+            # 添加"加载中..."占位符
+            loading_item = QTreeWidgetItem(parent_item)
+            loading_item.setText(0, "加载中...")
+            loading_item.setDisabled(True)
             
-            # 过滤出目录项
-            for item in items:
-                if item['is_dir']:
-                    child_item = QTreeWidgetItem(parent_item)
-                    child_item.setText(0, f"📁 {item['name']}")
-                    child_path = path.rstrip('/') + '/' + item['name']
-                    child_item.setData(0, Qt.ItemDataRole.UserRole, {"path": child_path, "name": item['name']})
-                    
-                    # 标记为可展开(添加一个空子项作为占位符)
-                    dummy_item = QTreeWidgetItem(child_item)
-                    dummy_item.setText(0, "加载中...")
+            # 异步获取该目录的子目录
+            import asyncio
+            asyncio.ensure_future(self._load_subdirs_async(path, parent_item, loading_item))
         except Exception as e:
             logger.error(f"加载子目录失败: {e}")
     
+    async def _load_subdirs_async(self, path: str, parent_item: QTreeWidgetItem, loading_item: QTreeWidgetItem):
+        """异步加载子目录"""
+        logger.info(f"开始加载子目录: {path}")
+        try:
+            # 获取目录列表
+            items = await self.sftp_manager.sftp.readdir(path)
+            logger.info(f"获取到目录列表: {len(items)} 项")
+            
+            # 移除"加载中..."占位符
+            if loading_item:
+                parent_item.removeChild(loading_item)
+            
+            # 只添加文件夹到目录树
+            import stat
+            dir_count = 0
+            for name in items:
+                if stat.S_ISDIR(name.attrs.permissions):
+                    dir_name = name.filename
+                    dir_path = path.rstrip('/') + '/' + dir_name
+                    
+                    # 添加子节点
+                    child_item = QTreeWidgetItem(parent_item)
+                    child_item.setText(0, "📁 " + dir_name)
+                    child_item.setData(0, Qt.ItemDataRole.UserRole, {"path": dir_path, "name": dir_name})
+                    
+                    # 添加"加载中..."占位符，用于懒加载
+                    placeholder = QTreeWidgetItem(child_item)
+                    placeholder.setText(0, "加载中...")
+                    placeholder.setDisabled(True)
+                    dir_count += 1
+            
+            logger.info(f"子目录加载完成: {path}, 共 {dir_count} 个子目录")
+            
+            # 如果是根目录加载完成，且还未进行过首次自动定位，则自动定位到用户目录
+            if path == "/" and not self._initial_auto_select_done:
+                self._initial_auto_select_done = True  # 标记已完成首次定位
+                import asyncio
+                asyncio.ensure_future(self._auto_select_user_dir())
+        except Exception as e:
+            logger.error(f"加载子目录失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            if loading_item:
+                loading_item.setText(0, "加载失败")
+    
+    async def _auto_select_user_dir(self):
+        """自动定位并选择用户目录"""
+        try:
+            # 获取当前用户名
+            username = None
+            if self.current_session and hasattr(self.current_session, 'session_info'):
+                username = self.current_session.session_info.get('username')
+            
+            if not username:
+                logger.warning("无法获取用户名，使用根目录")
+                return
+            
+            logger.info(f"当前用户名: {username}")
+            
+            # 尝试常见的用户目录路径
+            user_dirs = [
+                f"/home/{username}",
+                f"/Users/{username}",
+            ]
+            
+            if username == "root":
+                user_dirs.append("/root")
+            
+            # 检查哪个用户目录存在
+            for user_dir in user_dirs:
+                try:
+                    await self.sftp_manager.sftp.stat(user_dir)
+                    logger.info(f"找到用户目录: {user_dir}")
+                    
+                    # 等待目录树加载完成
+                    import asyncio
+                    await asyncio.sleep(0.3)
+                    
+                    # 确保用户目录节点已加载到目录树中
+                    # 如果用户目录是 /home/user，需要确保 /home 节点已展开
+                    if user_dir.count('/') > 1:
+                        parent_dir = '/'.join(user_dir.split('/')[:-1]) or '/'
+                        await self._ensure_dir_tree_node_loaded(parent_dir)
+                        await asyncio.sleep(0.2)
+                    
+                    # 在目录树中查找并选中该节点
+                    self._select_tree_node_by_path(user_dir)
+                    
+                    # 切换右侧显示
+                    self.sftp_manager.change_directory(user_dir)
+                    self.path_edit.setText(user_dir)
+                    logger.info(f"自动定位到用户目录: {user_dir}")
+                    return
+                except Exception as e:
+                    logger.debug(f"目录 {user_dir} 不存在: {e}")
+                    continue
+            
+            # 如果都没找到，使用根目录
+            logger.info("未找到用户目录，使用根目录")
+        except Exception as e:
+            logger.error(f"自动定位用户目录失败: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    async def _ensure_dir_tree_node_loaded(self, path: str):
+        """确保目录树中的节点已加载"""
+        try:
+            # 查找节点
+            item = self._find_tree_node_by_path(path)
+            if item and item.childCount() == 1:
+                first_child = item.child(0)
+                if first_child.text(0) == "加载中...":
+                    # 正在加载，等待
+                    import asyncio
+                    await asyncio.sleep(0.5)
+                elif first_child.text(0) == "加载中...":
+                    # 需要手动加载
+                    item.removeChild(first_child)
+                    self._load_children_for_node(item, path)
+                    import asyncio
+                    await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.debug(f"确保节点加载失败: {e}")
+    
+    def _find_tree_node_by_path(self, target_path: str):
+        """根据路径查找目录树节点"""
+        if target_path == "/":
+            return self.dir_tree.topLevelItem(0)
+        
+        return self._find_node_recursive(self.dir_tree, target_path)
+    
+    def _find_node_recursive(self, tree_or_item, target_path: str):
+        """递归查找节点"""
+        if isinstance(tree_or_item, QTreeWidget):
+            for i in range(tree_or_item.topLevelItemCount()):
+                item = tree_or_item.topLevelItem(i)
+                result = self._find_node_recursive(item, target_path)
+                if result:
+                    return result
+        else:
+            item = tree_or_item
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if data and data.get('path') == target_path:
+                return item
+            
+            for i in range(item.childCount()):
+                child = item.child(i)
+                result = self._find_node_recursive(child, target_path)
+                if result:
+                    return result
+        
+        return None
+    
+    def _select_tree_node_by_path(self, target_path: str):
+        """根据路径选中目录树节点"""
+        item = self._find_tree_node_by_path(target_path)
+        if item:
+            self.dir_tree.setCurrentItem(item)
+            # 不展开节点，只选中
+            logger.info(f"已选中目录树节点: {target_path}")
+        else:
+            logger.warning(f"未找到目录树节点: {target_path}")
+    
+    def _on_directory_tree_ready(self, tree):
+        """目录树准备好后的回调"""
+        # 清空并重新填充目录树
+        self.dir_tree.clear()
+        
+        # 添加根节点
+        root_item = QTreeWidgetItem(self.dir_tree)
+        root_item.setText(0, "📁 /")
+        root_item.setData(0, Qt.ItemDataRole.UserRole, {"path": "/", "name": "/"})
+        root_item.setExpanded(True)
+        
+        # 添加子节点
+        for node in tree:
+            self._add_tree_node(node, root_item)
+    
+    def _add_tree_node(self, node, parent):
+        """添加目录树节点"""
+        item = QTreeWidgetItem(parent)
+        item.setText(0, "📁 " + node['name'])
+        item.setData(0, Qt.ItemDataRole.UserRole, {"path": node['path'], "name": node['name']})
+        
+        # 添加子节点
+        for child in node.get('children', []):
+            self._add_tree_node(child, item)
+    
     def _on_dir_tree_clicked(self, item, column):
-        """点击目录树节点"""
+        """点击目录树节点 - 切换目录显示"""
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data and 'path' in data:
             path = data['path']
-            # 切换到该目录
-            if self.sftp_manager.change_directory(path):
-                self.refresh()
-                self.path_edit.setText(path)
+            # 切换到该目录（change_directory内部会触发目录列表刷新）
+            self.sftp_manager.change_directory(path)
+            self.path_edit.setText(path)
+    
+    def _on_dir_tree_expanded(self, item):
+        """展开目录树节点时加载子目录"""
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data and 'path' in data:
+            path = data['path']
+            logger.info(f"展开目录节点: {path}, 当前子节点数: {item.childCount()}")
+            
+            # 检查是否已经加载过子节点
+            if item.childCount() == 1:
+                first_child = item.child(0)
+                if first_child.text(0) == "加载中...":
+                    # 有占位符，需要加载子目录
+                    logger.info(f"移除占位符，开始加载子目录: {path}")
+                    item.removeChild(first_child)
+                    self._load_children_for_node(item, path)
+                elif first_child.text(0) == "加载失败":
+                    # 移除失败提示，重新加载
+                    logger.info(f"重新加载失败的子目录: {path}")
+                    item.removeChild(first_child)
+                    self._load_children_for_node(item, path)
+                # else: 已加载过子节点，无需操作
+            elif item.childCount() == 0:
+                # 没有子节点，首次加载
+                logger.info(f"首次加载子目录: {path}")
+                self._load_children_for_node(item, path)
     
     def _on_dir_tree_double_clicked(self, item, column):
         """双击目录树节点(展开/折叠 + 懒加载)"""
-        # 检查是否有"加载中..."的占位符
-        if item.childCount() == 1:
-            first_child = item.child(0)
-            if first_child.text(0) == "加载中...":
-                # 移除占位符
-                item.removeChild(first_child)
-                
-                # 加载实际的子目录
-                data = item.data(0, Qt.ItemDataRole.UserRole)
-                if data and 'path' in data:
-                    self._load_children_for_node(item, data['path'])
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if data and 'path' in data:
+            path = data['path']
+            
+            # 检查是否已经加载过子节点
+            # 如果只有一个子节点且是"加载中..."，说明正在加载或需要加载
+            if item.childCount() == 1:
+                first_child = item.child(0)
+                if first_child.text(0) == "加载中...":
+                    # 移除占位符
+                    item.removeChild(first_child)
+                    # 加载实际的子目录
+                    self._load_children_for_node(item, path)
+                elif first_child.text(0) == "加载失败":
+                    # 移除失败提示，重新加载
+                    item.removeChild(first_child)
+                    self._load_children_for_node(item, path)
+            elif item.childCount() == 0:
+                # 没有子节点，首次加载
+                self._load_children_for_node(item, path)
         
-        # 切换展开/折叠状态
+        # 切换展开/折叠状态（延迟执行，让懒加载先完成）
+        import asyncio
+        asyncio.ensure_future(self._delayed_toggle_expand(item))
+    
+    async def _delayed_toggle_expand(self, item):
+        """延迟切换展开状态"""
+        import asyncio
+        await asyncio.sleep(0.1)  # 等待懒加载完成
         item.setExpanded(not item.isExpanded())
     
     def _create_path_bar(self, layout):
@@ -278,6 +506,11 @@ class SftpFileManager(QFrame):
         self.sftp_manager.error_occurred.connect(self._on_error)
         self.sftp_manager.progress_updated.connect(self._on_progress)
         self.sftp_manager.operation_completed.connect(self.refresh)
+        
+        # 新增的异步信号
+        self.sftp_manager.directory_listed.connect(self._on_directory_listed)
+        self.sftp_manager.file_operation_result.connect(self._on_file_operation_result)
+        self.sftp_manager.directory_tree_ready.connect(self._on_directory_tree_ready)
     
     def connect_session(self, ssh_connection):
         """
@@ -299,20 +532,18 @@ class SftpFileManager(QFrame):
             return False
         
         logger.info(f"SSH连接状态: {ssh_connection.is_connected}")
-        logger.info(f"SSH客户端: {ssh_connection.client}")
+        logger.info(f"SSH连接对象: {ssh_connection.conn}")
         
         self.current_session = ssh_connection
         
-        # 使用SSH连接创建SFTP
+        # 使用SSH连接创建SFTP - 使用异步方法
         try:
             # 复用SSH连接
             logger.info("正在打开SFTP通道...")
-            self.sftp_manager.ssh_client = ssh_connection.client
-            self.sftp_manager.sftp_client = ssh_connection.client.open_sftp()
-            self.sftp_manager.is_connected = True
-            
-            logger.info("SFTP连接已建立")
-            self._on_connected()
+            self.sftp_manager.conn = ssh_connection.conn
+            # 使用异步方式打开SFTP
+            import asyncio
+            asyncio.ensure_future(self._open_sftp_channel())
             return True
             
         except Exception as e:
@@ -322,17 +553,28 @@ class SftpFileManager(QFrame):
             logger.error(traceback.format_exc())
             QMessageBox.critical(self, "错误", error_msg)
             return False
+
+    async def _open_sftp_channel(self):
+        """异步打开SFTP通道"""
+        try:
+            self.sftp_manager.sftp = await self.sftp_manager.conn.start_sftp_client()
+            self.sftp_manager.is_connected = True
+            logger.info("SFTP连接已建立")
+            self._on_connected()
+        except Exception as e:
+            error_msg = f"SFTP连接失败: {str(e)}"
+            logger.error(error_msg)
+            self.sftp_manager.error_occurred.emit(error_msg)
     
     def disconnect(self):
         """断开SFTP连接"""
         if self.sftp_manager.is_connected:
             try:
-                if self.sftp_manager.sftp_client:
-                    self.sftp_manager.sftp_client.close()
-                    self.sftp_manager.sftp_client = None
-                self.sftp_manager.is_connected = False
+                # 使用异步断开连接
+                import asyncio
+                asyncio.ensure_future(self.sftp_manager._do_disconnect())
                 self.file_tree.clear()
-                self.dir_tree.clear()  # 清空目录树
+                self.dir_tree.clear()
                 self.path_edit.setText("/")
                 logger.info("SFTP已断开")
             except Exception as e:
@@ -343,8 +585,8 @@ class SftpFileManager(QFrame):
         if not self.sftp_manager.is_connected:
             return
         
-        items = self.sftp_manager.list_directory()
-        self._update_file_list(items)
+        # 使用异步版本
+        self.sftp_manager.list_directory_async()
         self.path_edit.setText(self.sftp_manager.get_current_path())
         
         # 更新目录树
@@ -440,16 +682,8 @@ class SftpFileManager(QFrame):
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"正在上传: {file_name}")
         
-        # 上传
-        success = self.sftp_manager.upload_file(file_path, remote_path)
-        
-        self.progress_bar.setVisible(False)
-        self.progress_label.setText("")
-        
-        if success:
-            QMessageBox.information(self, "成功", f"文件上传成功: {file_name}")
-        else:
-            QMessageBox.critical(self, "失败", "文件上传失败")
+        # 使用异步上传
+        self.sftp_manager.upload_file_async(file_path, remote_path)
     
     def download_file(self):
         """下载文件"""
@@ -487,16 +721,8 @@ class SftpFileManager(QFrame):
         self.progress_bar.setValue(0)
         self.progress_label.setText(f"正在下载: {data['name']}")
         
-        # 下载
-        success = self.sftp_manager.download_file(remote_path, save_path)
-        
-        self.progress_bar.setVisible(False)
-        self.progress_label.setText("")
-        
-        if success:
-            QMessageBox.information(self, "成功", f"文件下载成功")
-        else:
-            QMessageBox.critical(self, "失败", "文件下载失败")
+        # 使用异步下载
+        self.sftp_manager.download_file_async(remote_path, save_path)
     
     def create_directory(self):
         """创建文件夹"""
@@ -505,10 +731,6 @@ class SftpFileManager(QFrame):
             return
         
         # 输入文件夹名称
-        dir_name, ok = QFileDialog.getExistingDirectory(
-            self, "选择父目录"
-        )
-        
         from PySide6.QtWidgets import QInputDialog
         dir_name, ok = QInputDialog.getText(
             self, "新建文件夹", "请输入文件夹名称:"
@@ -521,10 +743,8 @@ class SftpFileManager(QFrame):
         current_path = self.sftp_manager.get_current_path()
         new_path = current_path + "/" + dir_name.strip()
         
-        if self.sftp_manager.mkdir(new_path):
-            QMessageBox.information(self, "成功", "文件夹创建成功")
-        else:
-            QMessageBox.critical(self, "失败", "文件夹创建失败")
+        # 使用异步创建
+        self.sftp_manager.mkdir_async(new_path)
     
     def delete_selected(self):
         """删除选中的文件/文件夹"""
@@ -553,7 +773,8 @@ class SftpFileManager(QFrame):
         for item in selected:
             data = item.data(0, Qt.ItemDataRole.UserRole)
             path = current_path + "/" + data['name']
-            self.sftp_manager.delete(path, data['is_dir'])
+            # 使用异步删除
+            self.sftp_manager.delete_async(path, data['is_dir'])
     
     def _show_context_menu(self, pos):
         """显示右键菜单"""
@@ -572,7 +793,6 @@ class SftpFileManager(QFrame):
     def _on_connected(self):
         """连接成功"""
         logger.info("SFTP连接成功,开始刷新目录")
-        self.refresh()
         # 加载目录树
         self._load_directory_tree()
         logger.info("目录刷新完成")
@@ -592,6 +812,25 @@ class SftpFileManager(QFrame):
             percent = int(current / total * 100)
             self.progress_bar.setValue(percent)
             self.progress_label.setText(f"传输中: {percent}%")
+    
+    def _on_directory_listed(self, items):
+        """目录列表异步返回"""
+        self._update_file_list(items)
+        
+        # 同时更新目录树（如果是根目录加载）
+        current_path = self.sftp_manager.get_current_path()
+        if current_path == "/":
+            self._load_directory_tree()
+    
+    def _on_file_operation_result(self, success, operation_name):
+        """文件操作结果异步返回"""
+        if success:
+            logger.info(f"文件操作成功: {operation_name}")
+            # 操作成功后刷新列表
+            self.refresh()
+        else:
+            logger.error(f"文件操作失败: {operation_name}")
+            QMessageBox.critical(self, "错误", f"{operation_name} 操作失败")
 
 
 class SftpFileManagerWindow(QDialog):
