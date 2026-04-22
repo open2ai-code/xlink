@@ -131,7 +131,7 @@ class SftpFileManager(QFrame):
         
         # 添加标题
         tree_label = QLabel("📂 目录结构")
-        tree_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; background-color: #2d2d30; color: #d4d4d4; }")
+        tree_label.setStyleSheet("QLabel { font-weight: bold; padding: 5px; }")
         tree_layout.addWidget(tree_label)
         
         # 创建树形控件
@@ -456,7 +456,7 @@ class SftpFileManager(QFrame):
         path_layout.addWidget(path_label)
         
         self.path_edit = QLabel("/")
-        self.path_edit.setStyleSheet("QLabel { background-color: #1e1e1e; padding: 5px; border: 1px solid #3e3e3e; }")
+        self.path_edit.setStyleSheet("QLabel { padding: 5px; border: 1px solid #ccc; }")
         path_layout.addWidget(self.path_edit)
         
         layout.addLayout(path_layout)
