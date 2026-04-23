@@ -10,7 +10,7 @@ SFTP文件管理模块
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QToolBar, QToolButton, QFileDialog, QMessageBox, QProgressBar,
-    QLabel, QHeaderView, QMenu, QSplitter, QDockWidget, QDialog
+    QLabel, QHeaderView, QMenu, QSplitter, QDockWidget, QDialog, QApplication, QPushButton
 )
 from PySide6.QtCore import Qt, Signal as pyqtSignal, QThread
 from PySide6.QtGui import QAction, QIcon, QStandardItemModel, QStandardItem
@@ -27,15 +27,154 @@ logger = get_logger("SFTP")
 class SftpFileManager(QFrame):
     """SFTP文件管理核心组件"""
     
+    # 统一样式表（浅色主题）
+    STYLESHEET = """
+    /* 工具栏样式 */
+    QToolBar {
+        background-color: #f5f5f5;
+        border: none;
+        padding: 5px;
+        spacing: 5px;
+    }
+    
+    QToolButton {
+        background-color: #ffffff;
+        border: 1px solid #cccccc;
+        border-radius: 3px;
+        padding: 5px 10px;
+        color: #333333;
+    }
+    
+    QToolButton:hover {
+        background-color: #e8e8e8;
+    }
+    
+    QToolButton:pressed {
+        background-color: #0078d4;
+        color: #ffffff;
+    }
+    
+    /* 目录树样式 */
+    QTreeWidget {
+        background-color: #ffffff;
+        border: 1px solid #cccccc;
+        color: #333333;
+        alternate-background-color: #f9f9f9;
+    }
+    
+    QTreeWidget::item {
+        padding: 3px;
+    }
+    
+    QTreeWidget::item:hover {
+        background-color: #e5f3ff;
+    }
+    
+    QTreeWidget::item:selected {
+        background-color: #cce8ff;
+    }
+    
+    /* 文件列表样式 */
+    QHeaderView::section {
+        background-color: #f5f5f5;
+        color: #333333;
+        padding: 5px;
+        border: 1px solid #cccccc;
+    }
+    
+    /* 分割器样式 */
+    QSplitter::handle {
+        background-color: #cccccc;
+    }
+    
+    QSplitter::handle:horizontal {
+        width: 2px;
+    }
+    
+    /* 进度条样式 */
+    QProgressBar {
+        border: 1px solid #cccccc;
+        border-radius: 3px;
+        text-align: center;
+        background-color: #ffffff;
+        color: #333333;
+    }
+    
+    QProgressBar::chunk {
+        background-color: #0078d4;
+        border-radius: 2px;
+    }
+    
+    /* 标签样式 */
+    QLabel {
+        color: #333333;
+    }
+    
+    /* 菜单样式 */
+    QMenu {
+        background-color: #ffffff;
+        border: 1px solid #cccccc;
+        color: #333333;
+    }
+    
+    QMenu::item {
+        padding: 5px 20px 5px 20px;
+    }
+    
+    QMenu::item:selected {
+        background-color: #cce8ff;
+    }
+    
+    QMenu::separator {
+        height: 1px;
+        background-color: #cccccc;
+        margin: 5px 0px;
+    }
+    """
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         
         self.sftp_manager = SFTPManager()
         self.current_session = None
         self._initial_auto_select_done = False  # 标记是否已完成首次自动定位
+        self._dir_tree_cache = {}  # 目录树缓存 {path: [children]}
+        self._async_tasks = {}  # 异步任务管理 {task_name: task}
         
         self._init_ui()
         self._connect_signals()
+        self.setStyleSheet(self.STYLESHEET)  # 应用统一样式
+    
+    def _create_async_task(self, name, coro):
+        """创建并管理异步任务"""
+        import asyncio
+        # 取消同名旧任务
+        if name in self._async_tasks:
+            old_task = self._async_tasks[name]
+            if not old_task.done():
+                old_task.cancel()
+        
+        # 创建新任务
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            task = loop.create_task(coro)
+        else:
+            task = asyncio.ensure_future(coro)
+        
+        self._async_tasks[name] = task
+        
+        # 任务完成后自动清理
+        task.add_done_callback(lambda t: self._async_tasks.pop(name, None))
+        
+        return task
+    
+    def cancel_all_tasks(self):
+        """取消所有异步任务"""
+        import asyncio
+        for name, task in self._async_tasks.items():
+            if not task.done():
+                task.cancel()
+        self._async_tasks.clear()
     
     def _init_ui(self):
         """初始化UI"""
@@ -139,6 +278,7 @@ class SftpFileManager(QFrame):
         self.dir_tree.setHeaderLabels(["目录"])
         self.dir_tree.header().setVisible(False)
         self.dir_tree.setSelectionMode(QTreeWidget.SelectionMode.SingleSelection)
+        self.dir_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         
         # 点击目录切换
         self.dir_tree.itemClicked.connect(self._on_dir_tree_clicked)
@@ -148,6 +288,9 @@ class SftpFileManager(QFrame):
         
         # 展开节点时加载子目录
         self.dir_tree.itemExpanded.connect(self._on_dir_tree_expanded)
+        
+        # 右键菜单
+        self.dir_tree.customContextMenuRequested.connect(self._show_dir_tree_context_menu)
         
         tree_layout.addWidget(self.dir_tree)
         
@@ -166,11 +309,14 @@ class SftpFileManager(QFrame):
         root_item = QTreeWidgetItem(self.dir_tree)
         root_item.setText(0, "📁 /")
         root_item.setData(0, Qt.ItemDataRole.UserRole, {"path": "/", "name": "/"})
-        root_item.setExpanded(True)
         
-        # 异步加载根目录的子文件夹
-        import asyncio
-        asyncio.ensure_future(self._load_subdirs_async("/", root_item, None))
+        # 添加"加载中..."占位符，用于懒加载
+        placeholder = QTreeWidgetItem(root_item)
+        placeholder.setText(0, "加载中...")
+        placeholder.setDisabled(True)
+        
+        # 展开根节点（会触发_on_dir_tree_expanded加载子目录）
+        root_item.setExpanded(True)
     
     def _load_children_for_node(self, parent_item: QTreeWidgetItem, path: str):
         """
@@ -181,20 +327,47 @@ class SftpFileManager(QFrame):
             path: 父目录路径
         """
         try:
+            # 检查是否已有占位符
+            if parent_item.childCount() > 0:
+                first_child = parent_item.child(0)
+                if first_child.text(0) == "加载中...":
+                    return  # 已在加载中，避免重复加载
+            
             # 添加"加载中..."占位符
             loading_item = QTreeWidgetItem(parent_item)
             loading_item.setText(0, "加载中...")
             loading_item.setDisabled(True)
             
             # 异步获取该目录的子目录
-            import asyncio
-            asyncio.ensure_future(self._load_subdirs_async(path, parent_item, loading_item))
+            task_name = f"load_subdir_{path}"
+            self._create_async_task(task_name, self._load_subdirs_async(path, parent_item, loading_item))
         except Exception as e:
             logger.error(f"加载子目录失败: {e}")
     
     async def _load_subdirs_async(self, path: str, parent_item: QTreeWidgetItem, loading_item: QTreeWidgetItem):
-        """异步加载子目录"""
+        """异步加载子目录（带缓存）"""
         logger.info(f"开始加载子目录: {path}")
+        
+        # 检查缓存
+        if path in self._dir_tree_cache:
+            logger.info(f"使用缓存数据: {path}")
+            if loading_item:
+                parent_item.removeChild(loading_item)
+            
+            cached_children = self._dir_tree_cache[path]
+            for child_name, child_path in cached_children:
+                child_item = QTreeWidgetItem(parent_item)
+                child_item.setText(0, "📁 " + child_name)
+                child_item.setData(0, Qt.ItemDataRole.UserRole, {"path": child_path, "name": child_name})
+                
+                # 添加"加载中..."占位符，用于懒加载
+                placeholder = QTreeWidgetItem(child_item)
+                placeholder.setText(0, "加载中...")
+                placeholder.setDisabled(True)
+            
+            logger.info(f"从缓存加载: {path}, 共 {len(cached_children)} 个子目录")
+            return
+        
         try:
             # 获取目录列表
             items = await self.sftp_manager.sftp.readdir(path)
@@ -207,10 +380,14 @@ class SftpFileManager(QFrame):
             # 只添加文件夹到目录树
             import stat
             dir_count = 0
+            cached_children = []
             for name in items:
                 if stat.S_ISDIR(name.attrs.permissions):
                     dir_name = name.filename
                     dir_path = path.rstrip('/') + '/' + dir_name
+                    
+                    # 添加到缓存
+                    cached_children.append((dir_name, dir_path))
                     
                     # 添加子节点
                     child_item = QTreeWidgetItem(parent_item)
@@ -222,6 +399,9 @@ class SftpFileManager(QFrame):
                     placeholder.setText(0, "加载中...")
                     placeholder.setDisabled(True)
                     dir_count += 1
+            
+            # 保存到缓存
+            self._dir_tree_cache[path] = cached_children
             
             logger.info(f"子目录加载完成: {path}, 共 {dir_count} 个子目录")
             
@@ -449,14 +629,31 @@ class SftpFileManager(QFrame):
         item.setExpanded(not item.isExpanded())
     
     def _create_path_bar(self, layout):
-        """创建路径导航栏"""
+        """创建面包屑路径导航栏"""
         path_layout = QHBoxLayout()
+        path_layout.setContentsMargins(5, 5, 5, 5)
+        path_layout.setSpacing(5)
         
-        path_label = QLabel("路径:")
-        path_layout.addWidget(path_label)
+        # 创建面包屑容器
+        self.breadcrumb_frame = QFrame()
+        self.breadcrumb_frame.setObjectName("breadcrumb_frame")
+        self.breadcrumb_frame.setStyleSheet("""
+            QFrame#breadcrumb_frame {
+                background-color: #f8f8f8;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                padding: 3px;
+            }
+        """)
+        self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_frame)
+        self.breadcrumb_layout.setContentsMargins(8, 4, 8, 4)
+        self.breadcrumb_layout.setSpacing(3)
         
+        path_layout.addWidget(self.breadcrumb_frame, 1)
+        
+        # 保留原有的路径编辑（隐藏）
         self.path_edit = QLabel("/")
-        self.path_edit.setStyleSheet("QLabel { padding: 5px; border: 1px solid #ccc; }")
+        self.path_edit.setVisible(False)
         path_layout.addWidget(self.path_edit)
         
         layout.addLayout(path_layout)
@@ -468,6 +665,8 @@ class SftpFileManager(QFrame):
         self.file_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.file_tree.setSortingEnabled(True)  # 启用排序
+        self.file_tree.sortByColumn(0, Qt.SortOrder.AscendingOrder)  # 默认按名称排序
         
         # 双击进入文件夹
         self.file_tree.itemDoubleClicked.connect(self._on_item_double_clicked)
@@ -587,10 +786,96 @@ class SftpFileManager(QFrame):
         
         # 使用异步版本
         self.sftp_manager.list_directory_async()
-        self.path_edit.setText(self.sftp_manager.get_current_path())
+        current_path = self.sftp_manager.get_current_path()
+        self.path_edit.setText(current_path)
+        self._update_breadcrumb(current_path)
         
         # 更新目录树
         self._load_directory_tree()
+    
+    def _update_breadcrumb(self, path):
+        """更新面包屑导航"""
+        # 清除现有的面包屑项
+        while self.breadcrumb_layout.count():
+            item = self.breadcrumb_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # 解析路径
+        if not path or path == "/":
+            self._add_breadcrumb_item("🏠 根目录", "/", is_last=True)
+            return
+        
+        # 分割路径
+        parts = [p for p in path.split('/') if p]
+        current_path = ""
+        
+        # 添加根目录
+        self._add_breadcrumb_item("🏠 根目录", "/", is_last=False)
+        
+        # 添加各级目录
+        for i, part in enumerate(parts):
+            current_path += "/" + part
+            is_last = (i == len(parts) - 1)
+            self._add_breadcrumb_item(part, current_path, is_last)
+    
+    def _add_breadcrumb_item(self, text, path, is_last=False):
+        """添加面包屑项"""
+        # 添加分隔符
+        if self.breadcrumb_layout.count() > 0:
+            sep = QLabel("›")
+            sep.setStyleSheet("QLabel { color: #999999; padding: 0 6px; font-size: 14px; }")
+            self.breadcrumb_layout.addWidget(sep)
+        
+        # 添加面包屑按钮
+        btn = QPushButton(text)
+        btn.setObjectName("breadcrumb_btn")
+        
+        if is_last:
+            btn.setStyleSheet("""
+                QPushButton#breadcrumb_btn {
+                    background: none;
+                    border: none;
+                    color: #0078d4;
+                    font-weight: bold;
+                    padding: 3px 6px;
+                    font-size: 13px;
+                }
+                QPushButton#breadcrumb_btn:hover {
+                    background-color: #e5f3ff;
+                    border-radius: 3px;
+                }
+            """)
+            btn.setEnabled(False)
+            btn.setToolTip(f"当前目录: {path}")
+        else:
+            btn.setStyleSheet("""
+                QPushButton#breadcrumb_btn {
+                    background: none;
+                    border: none;
+                    color: #444444;
+                    padding: 3px 6px;
+                    font-size: 13px;
+                    border-radius: 3px;
+                }
+                QPushButton#breadcrumb_btn:hover {
+                    background-color: #e8e8e8;
+                    color: #0078d4;
+                }
+                QPushButton#breadcrumb_btn:pressed {
+                    background-color: #d0d0d0;
+                }
+            """)
+            btn.clicked.connect(lambda checked, p=path: self._on_breadcrumb_clicked(p))
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(f"跳转到: {path}")
+        
+        self.breadcrumb_layout.addWidget(btn)
+    
+    def _on_breadcrumb_clicked(self, path):
+        """面包屑点击事件"""
+        self.sftp_manager.change_directory(path)
+        self.path_edit.setText(path)
     
     def _update_file_list(self, items):
         """更新文件列表"""
@@ -599,18 +884,21 @@ class SftpFileManager(QFrame):
         for item in items:
             tree_item = QTreeWidgetItem(self.file_tree)
             
-            # 名称
+            # 名称（文件夹优先）
             name = item['name']
             if item['is_dir']:
                 name = "📁 " + name
+                tree_item.setData(0, Qt.ItemDataRole.DisplayRole, "0" + name)  # 文件夹排前面
             else:
                 name = "📄 " + name
+                tree_item.setData(0, Qt.ItemDataRole.DisplayRole, "1" + name)
             tree_item.setText(0, name)
             tree_item.setData(0, Qt.ItemDataRole.UserRole, item)
             
-            # 大小
+            # 大小（存储原始字节数用于排序）
             if item['is_dir']:
                 size_str = "-"
+                tree_item.setData(1, Qt.ItemDataRole.DisplayRole, -1)  # 文件夹大小不参与排序
             else:
                 size = item['size']
                 if size < 1024:
@@ -621,11 +909,13 @@ class SftpFileManager(QFrame):
                     size_str = f"{size / (1024 * 1024):.1f} MB"
                 else:
                     size_str = f"{size / (1024 * 1024 * 1024):.1f} GB"
+                tree_item.setData(1, Qt.ItemDataRole.DisplayRole, size)
             tree_item.setText(1, size_str)
             
-            # 修改时间
+            # 修改时间（存储时间戳用于排序）
             mtime = datetime.fromtimestamp(item['mtime'])
             tree_item.setText(2, mtime.strftime("%Y-%m-%d %H:%M"))
+            tree_item.setData(2, Qt.ItemDataRole.DisplayRole, item['mtime'])
             
             # 权限
             tree_item.setText(3, item['permissions'])
@@ -777,18 +1067,68 @@ class SftpFileManager(QFrame):
             self.sftp_manager.delete_async(path, data['is_dir'])
     
     def _show_context_menu(self, pos):
-        """显示右键菜单"""
+        """显示文件列表右键菜单"""
         menu = QMenu(self)
         
-        menu.addAction(self.upload_action)
-        menu.addAction(self.download_action)
+        selected = self.file_tree.selectedItems()
+        if selected:
+            menu.addAction("📥 下载", self.download_file)
+            menu.addSeparator()
+            menu.addAction("🗑️ 删除", self.delete_selected)
+        else:
+            menu.addAction("📤 上传", self.upload_file)
+            menu.addSeparator()
+            menu.addAction("📁 新建文件夹", self.create_directory)
+        
         menu.addSeparator()
-        menu.addAction(self.mkdir_action)
-        menu.addAction(self.delete_action)
-        menu.addSeparator()
-        menu.addAction(self.refresh_action)
+        menu.addAction("🔄 刷新", self.refresh_action.trigger)
         
         menu.exec(self.file_tree.viewport().mapToGlobal(pos))
+    
+    def _show_dir_tree_context_menu(self, pos):
+        """显示目录树右键菜单"""
+        item = self.dir_tree.itemAt(pos)
+        if not item:
+            return
+        
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not data or 'path' not in data:
+            return
+        
+        path = data['path']
+        
+        menu = QMenu(self)
+        menu.addAction("📂 在此目录打开", lambda: self._open_in_this_dir(path))
+        menu.addSeparator()
+        menu.addAction("📁 在此处新建文件夹", lambda: self._mkdir_in_dir(path))
+        menu.addSeparator()
+        menu.addAction("📋 复制路径", lambda: self._copy_path(path))
+        
+        menu.exec(self.dir_tree.viewport().mapToGlobal(pos))
+    
+    def _open_in_this_dir(self, path):
+        """在指定目录打开"""
+        self.sftp_manager.change_directory(path)
+        self.path_edit.setText(path)
+    
+    def _mkdir_in_dir(self, parent_path):
+        """在指定目录新建文件夹"""
+        from PySide6.QtWidgets import QInputDialog
+        dir_name, ok = QInputDialog.getText(
+            self, "新建文件夹", "请输入文件夹名称:"
+        )
+        
+        if not ok or not dir_name.strip():
+            return
+        
+        new_path = parent_path.rstrip('/') + '/' + dir_name.strip()
+        self.sftp_manager.mkdir_async(new_path)
+    
+    def _copy_path(self, path):
+        """复制路径到剪贴板"""
+        from PySide6.QtGui import QClipboard
+        clipboard = QApplication.clipboard()
+        clipboard.setText(path)
     
     def _on_connected(self):
         """连接成功"""
@@ -816,11 +1156,6 @@ class SftpFileManager(QFrame):
     def _on_directory_listed(self, items):
         """目录列表异步返回"""
         self._update_file_list(items)
-        
-        # 同时更新目录树（如果是根目录加载）
-        current_path = self.sftp_manager.get_current_path()
-        if current_path == "/":
-            self._load_directory_tree()
     
     def _on_file_operation_result(self, success, operation_name):
         """文件操作结果异步返回"""
