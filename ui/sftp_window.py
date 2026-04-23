@@ -875,13 +875,17 @@ class SftpFileManager(QFrame):
     def _on_breadcrumb_clicked(self, path):
         """面包屑点击事件"""
         self.sftp_manager.change_directory(path)
-        self.path_edit.setText(path)
+        self._update_breadcrumb(path)
     
     def _update_file_list(self, items):
         """更新文件列表"""
         self.file_tree.clear()
         
         for item in items:
+            # 过滤掉 '.' 和 '..' 特殊目录
+            if item['name'] in ('.', '..'):
+                continue
+            
             tree_item = QTreeWidgetItem(self.file_tree)
             
             # 名称（文件夹优先）
@@ -1133,6 +1137,8 @@ class SftpFileManager(QFrame):
     def _on_connected(self):
         """连接成功"""
         logger.info("SFTP连接成功,开始刷新目录")
+        # 初始化面包屑导航
+        self._update_breadcrumb("/")
         # 加载目录树
         self._load_directory_tree()
         logger.info("目录刷新完成")
@@ -1156,6 +1162,9 @@ class SftpFileManager(QFrame):
     def _on_directory_listed(self, items):
         """目录列表异步返回"""
         self._update_file_list(items)
+        # 更新面包屑导航
+        current_path = self.sftp_manager.get_current_path()
+        self._update_breadcrumb(current_path)
     
     def _on_file_operation_result(self, success, operation_name):
         """文件操作结果异步返回"""
