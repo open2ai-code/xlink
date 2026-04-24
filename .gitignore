@@ -37,3 +37,4 @@ Thumbs.db
 
 # WorkBuddy 工作记忆（本地数据，不提交）
 .workbuddy/
+/config/sessions.json

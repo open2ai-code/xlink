@@ -10,11 +10,10 @@ SFTP文件管理模块
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QHBoxLayout, QTreeWidget, QTreeWidgetItem,
     QToolBar, QToolButton, QFileDialog, QMessageBox, QProgressBar,
-    QLabel, QHeaderView, QMenu, QSplitter, QDockWidget, QDialog, QApplication, QPushButton,
-    QLineEdit, QScrollArea
+    QLabel, QHeaderView, QMenu, QSplitter, QDockWidget, QDialog, QApplication, QPushButton
 )
 from PySide6.QtCore import Qt, Signal as pyqtSignal, QThread
-from PySide6.QtGui import QAction, QIcon, QStandardItemModel, QStandardItem, QShortcut
+from PySide6.QtGui import QAction, QIcon, QStandardItemModel, QStandardItem
 from datetime import datetime
 import os
 from typing import List, Dict
@@ -141,9 +140,6 @@ class SftpFileManager(QFrame):
         self._initial_auto_select_done = False  # 标记是否已完成首次自动定位
         self._dir_tree_cache = {}  # 目录树缓存 {path: [children]}
         self._async_tasks = {}  # 异步任务管理 {task_name: task}
-        self._breadcrumb_history = []  # 路径历史记录
-        self._history_index = -1  # 当前历史索引
-        self._last_breadcrumb_path = ""  # 上次面包屑路径，用于避免重复重建
         
         self._init_ui()
         self._connect_signals()
@@ -638,93 +634,22 @@ class SftpFileManager(QFrame):
         path_layout.setContentsMargins(5, 5, 5, 5)
         path_layout.setSpacing(5)
         
-        # 左侧图标
-        icon_label = QLabel("📍")
-        icon_label.setStyleSheet("QLabel { font-size: 16px; padding: 0 5px; }")
-        path_layout.addWidget(icon_label)
-        
-        # 创建面包屑容器（带滚动支持）
-        self.breadcrumb_scroll = QScrollArea()
-        self.breadcrumb_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.breadcrumb_scroll.setWidgetResizable(True)
-        self.breadcrumb_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.breadcrumb_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self.breadcrumb_scroll.setMaximumHeight(32)
-        self.breadcrumb_scroll.setStyleSheet("""
-            QScrollArea {
-                background-color: #f8f8f8;
-                border: 1px solid #d0d0d0;
-                border-radius: 4px;
-            }
-            QScrollBar:horizontal {
-                height: 8px;
-                background: #f0f0f0;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:horizontal {
-                background: #c0c0c0;
-                border-radius: 4px;
-                min-width: 20px;
-            }
-            QScrollBar::handle:horizontal:hover {
-                background: #a0a0a0;
-            }
-        """)
-        
+        # 创建面包屑容器
         self.breadcrumb_frame = QFrame()
         self.breadcrumb_frame.setObjectName("breadcrumb_frame")
         self.breadcrumb_frame.setStyleSheet("""
             QFrame#breadcrumb_frame {
-                background-color: transparent;
-                border: none;
+                background-color: #f8f8f8;
+                border: 1px solid #d0d0d0;
+                border-radius: 4px;
+                padding: 3px;
             }
         """)
         self.breadcrumb_layout = QHBoxLayout(self.breadcrumb_frame)
         self.breadcrumb_layout.setContentsMargins(8, 4, 8, 4)
-        self.breadcrumb_layout.setSpacing(2)
+        self.breadcrumb_layout.setSpacing(3)
         
-        self.breadcrumb_scroll.setWidget(self.breadcrumb_frame)
-        path_layout.addWidget(self.breadcrumb_scroll, 1)
-        
-        # 复制路径按钮
-        self.copy_path_btn = QPushButton("📋")
-        self.copy_path_btn.setObjectName("copy_path_btn")
-        self.copy_path_btn.setToolTip("复制当前路径")
-        self.copy_path_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.copy_path_btn.setFixedSize(28, 28)
-        self.copy_path_btn.setStyleSheet("""
-            QPushButton#copy_path_btn {
-                background-color: #ffffff;
-                border: 1px solid #d0d0d0;
-                border-radius: 4px;
-                font-size: 14px;
-            }
-            QPushButton#copy_path_btn:hover {
-                background-color: #e8e8e8;
-            }
-            QPushButton#copy_path_btn:pressed {
-                background-color: #d0d0d0;
-            }
-        """)
-        self.copy_path_btn.clicked.connect(self._copy_current_path)
-        path_layout.addWidget(self.copy_path_btn)
-        
-        # 路径输入框（默认隐藏）
-        self.path_input = QLineEdit()
-        self.path_input.setObjectName("path_input")
-        self.path_input.setVisible(False)
-        self.path_input.setStyleSheet("""
-            QLineEdit#path_input {
-                background-color: #ffffff;
-                border: 1px solid #0078d4;
-                border-radius: 4px;
-                padding: 4px 8px;
-                font-size: 13px;
-            }
-        """)
-        self.path_input.returnPressed.connect(self._on_path_input_return)
-        self.path_input.editingFinished.connect(self._hide_path_input)
-        path_layout.addWidget(self.path_input, 1)
+        path_layout.addWidget(self.breadcrumb_frame, 1)
         
         # 保留原有的路径编辑（隐藏）
         self.path_edit = QLabel("/")
@@ -785,15 +710,6 @@ class SftpFileManager(QFrame):
         self.sftp_manager.directory_listed.connect(self._on_directory_listed)
         self.sftp_manager.file_operation_result.connect(self._on_file_operation_result)
         self.sftp_manager.directory_tree_ready.connect(self._on_directory_tree_ready)
-        
-        # 键盘快捷键
-        self._setup_shortcuts()
-    
-    def _setup_shortcuts(self):
-        """设置键盘快捷键"""
-        # Ctrl+L 聚焦路径输入框
-        shortcut = QShortcut("Ctrl+L", self)
-        shortcut.activated.connect(self._show_path_input)
     
     def connect_session(self, ssh_connection):
         """
@@ -879,19 +795,11 @@ class SftpFileManager(QFrame):
     
     def _update_breadcrumb(self, path):
         """更新面包屑导航"""
-        # 避免重复重建
-        if path == self._last_breadcrumb_path:
-            return
-        self._last_breadcrumb_path = path
-        
         # 清除现有的面包屑项
         while self.breadcrumb_layout.count():
             item = self.breadcrumb_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        
-        # 添加到历史记录
-        self._add_to_history(path)
         
         # 解析路径
         if not path or path == "/":
@@ -902,86 +810,45 @@ class SftpFileManager(QFrame):
         parts = [p for p in path.split('/') if p]
         current_path = ""
         
-        # 判断是否需要截断（路径段超过5个时截断）
-        need_truncate = len(parts) > 5
-        
         # 添加根目录
-        self._add_breadcrumb_item("🏠", "/", is_last=False)
+        self._add_breadcrumb_item("🏠 根目录", "/", is_last=False)
         
         # 添加各级目录
         for i, part in enumerate(parts):
             current_path += "/" + part
             is_last = (i == len(parts) - 1)
-            
-            # 路径截断逻辑
-            if need_truncate and not is_last and i > 1 and i < len(parts) - 2:
-                # 中间部分用省略号代替
-                if i == 2:  # 只在第一次出现时添加省略号
-                    self._add_breadcrumb_item("...", current_path.rsplit('/', 1)[0], is_last=False, is_ellipsis=True)
-                continue
-            
             self._add_breadcrumb_item(part, current_path, is_last)
     
-    def _add_to_history(self, path):
-        """添加路径到历史记录"""
-        # 如果当前不在历史末尾，删除后面的记录
-        if self._history_index < len(self._breadcrumb_history) - 1:
-            self._breadcrumb_history = self._breadcrumb_history[:self._history_index + 1]
-        
-        # 添加新路径（避免重复）
-        if not self._breadcrumb_history or self._breadcrumb_history[-1] != path:
-            self._breadcrumb_history.append(path)
-            self._history_index = len(self._breadcrumb_history) - 1
-    
-    def _add_breadcrumb_item(self, text, path, is_last=False, is_ellipsis=False):
+    def _add_breadcrumb_item(self, text, path, is_last=False):
         """添加面包屑项"""
         # 添加分隔符
         if self.breadcrumb_layout.count() > 0:
-            sep = QLabel("/")
-            sep.setStyleSheet("QLabel { color: #bbbbbb; padding: 0 4px; font-size: 13px; }")
+            sep = QLabel("›")
+            sep.setStyleSheet("QLabel { color: #999999; padding: 0 6px; font-size: 14px; }")
             self.breadcrumb_layout.addWidget(sep)
         
         # 添加面包屑按钮
         btn = QPushButton(text)
         btn.setObjectName("breadcrumb_btn")
-        btn.setProperty("full_path", path)  # 存储完整路径用于右键菜单
         
-        if is_ellipsis:
-            # 省略号样式
+        if is_last:
             btn.setStyleSheet("""
                 QPushButton#breadcrumb_btn {
                     background: none;
                     border: none;
-                    color: #999999;
-                    padding: 3px 6px;
-                    font-size: 13px;
-                    border-radius: 3px;
-                }
-                QPushButton#breadcrumb_btn:hover {
-                    background-color: #e8e8e8;
-                    color: #0078d4;
-                }
-            """)
-            btn.clicked.connect(lambda checked, p=path: self._on_breadcrumb_clicked(p))
-            btn.setCursor(Qt.CursorShape.PointingHandCursor)
-            btn.setToolTip("点击展开完整路径")
-        elif is_last:
-            # 当前目录样式（高亮背景块）
-            btn.setStyleSheet("""
-                QPushButton#breadcrumb_btn {
-                    background-color: #e5f3ff;
-                    border: 1px solid #b3d9ff;
                     color: #0078d4;
                     font-weight: bold;
-                    padding: 3px 8px;
+                    padding: 3px 6px;
                     font-size: 13px;
+                }
+                QPushButton#breadcrumb_btn:hover {
+                    background-color: #e5f3ff;
                     border-radius: 3px;
                 }
             """)
             btn.setEnabled(False)
             btn.setToolTip(f"当前目录: {path}")
         else:
-            # 普通路径样式
             btn.setStyleSheet("""
                 QPushButton#breadcrumb_btn {
                     background: none;
@@ -1003,68 +870,7 @@ class SftpFileManager(QFrame):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.setToolTip(f"跳转到: {path}")
         
-        # 右键菜单显示完整路径
-        btn.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        btn.customContextMenuRequested.connect(
-            lambda pos, p=path: self._show_breadcrumb_context_menu(pos, p)
-        )
-        
         self.breadcrumb_layout.addWidget(btn)
-    
-    def _show_breadcrumb_context_menu(self, pos, path):
-        """显示面包屑右键菜单"""
-        menu = QMenu(self)
-        menu.addAction(f"📋 复制路径", lambda: self._copy_to_clipboard(path))
-        menu.addAction(f"📂 在目录树中定位", lambda: self._locate_in_tree(path))
-        menu.exec(self.breadcrumb_frame.mapToGlobal(pos))
-    
-    def _copy_current_path(self):
-        """复制当前路径到剪贴板"""
-        current_path = self.sftp_manager.get_current_path()
-        self._copy_to_clipboard(current_path)
-    
-    def _copy_to_clipboard(self, text):
-        """复制文本到剪贴板"""
-        from PySide6.QtGui import QClipboard
-        clipboard = QApplication.clipboard()
-        clipboard.setText(text)
-        
-        # 显示提示
-        self.copy_path_btn.setToolTip(f"已复制: {text}")
-        import asyncio
-        asyncio.ensure_future(self._reset_copy_tooltip())
-    
-    async def _reset_copy_tooltip(self):
-        """重置复制按钮提示"""
-        import asyncio
-        await asyncio.sleep(2)
-        self.copy_path_btn.setToolTip("复制当前路径")
-    
-    def _locate_in_tree(self, path):
-        """在目录树中定位路径"""
-        self._select_tree_node_by_path(path)
-    
-    def _show_path_input(self):
-        """显示路径输入框"""
-        self.breadcrumb_scroll.setVisible(False)
-        self.copy_path_btn.setVisible(False)
-        self.path_input.setVisible(True)
-        self.path_input.setText(self.sftp_manager.get_current_path())
-        self.path_input.setFocus()
-        self.path_input.selectAll()
-    
-    def _hide_path_input(self):
-        """隐藏路径输入框"""
-        self.path_input.setVisible(False)
-        self.breadcrumb_scroll.setVisible(True)
-        self.copy_path_btn.setVisible(True)
-    
-    def _on_path_input_return(self):
-        """路径输入框回车事件"""
-        new_path = self.path_input.text().strip()
-        if new_path:
-            self.sftp_manager.change_directory(new_path)
-        self._hide_path_input()
     
     def _on_breadcrumb_clicked(self, path):
         """面包屑点击事件"""
